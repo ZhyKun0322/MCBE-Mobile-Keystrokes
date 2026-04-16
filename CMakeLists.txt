@@ -25,7 +25,7 @@ include_directories(
 )
 
 set(SOURCES
-    libkeystrokes.cpp
+    libkeystrokes_mobile.cpp
     include/ImGui/imgui.cpp
     include/ImGui/imgui_draw.cpp
     include/ImGui/imgui_tables.cpp
