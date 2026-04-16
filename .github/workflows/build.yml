@@ -1,4 +1,4 @@
-name: Build Keystrokes
+name: Build libkeystrokes
 
 on:
   push:
