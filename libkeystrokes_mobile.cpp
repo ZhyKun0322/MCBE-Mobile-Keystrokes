@@ -514,7 +514,7 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
     if (w < 500 || h < 500) return orig_eglswapbuffers(dpy, surf);
     if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
-        if (ctx == g_targetcontext && surf == g_targetsurface) { 
+    if (ctx == g_targetcontext && surf == g_targetsurface) { 
         g_width = w; 
         g_height = h; 
         setup();   // Initialize ImGui if not already done
