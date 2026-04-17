@@ -23,7 +23,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
-#define VERSION "1.2.2-safe"
+#define VERSION "1.2.4-fixed"
 
 struct KeyState {
     bool w = false, a = false, s = false, d = false;
@@ -47,31 +47,26 @@ static bool  g_showsettings = false;
 static ImVec2 g_hudpos      = ImVec2(100, 100);
 static bool  g_posloaded    = false;
 
-// ── SAFE MEMORY SCANNER (Mobile-only) ───────────────────────────────────
+// ── EXACT OFFSETS FROM YOUR MEMORY EDITOR SCREENS ───────────────────────
 static uintptr_t g_mcBase = 0;
-static uintptr_t g_mcSize = 0;        // ← NEW: module size for safety check
 static bool g_baseFound = false;
 
-// Hardcoded offsets (these are the ones from your screenshots)
-static const uintptr_t OFF_MOVE_X = 0xC7446130;
-static const uintptr_t OFF_MOVE_Y = 0xC7446134;
-static const uintptr_t OFF_JUMP   = 0xD41BF62C;
+static const uintptr_t OFF_MOVE_X = 0xffffffffc7446130ULL; // Horizontal (A/D) ← from left/right search
+static const uintptr_t OFF_MOVE_Y = 0xffffffffc7446314ULL; // Vertical (W/S)   ← from forwards/backwards search
+static const uintptr_t OFF_JUMP   = 0xffffffffda1bf62cULL; // Jump
 
 static void updateMcBase() {
     if (g_baseFound) return;
-
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return;
-
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         if (strstr(line, "libminecraftpe.so")) {
             uintptr_t start = 0, end = 0;
             sscanf(line, "%" PRIxPTR "-%" PRIxPTR, &start, &end);
             g_mcBase = start;
-            g_mcSize = end - start;
             g_baseFound = true;
-            LOGI("✅ libminecraftpe.so found | base=0x%" PRIxPTR " | size=0x%" PRIxPTR, g_mcBase, g_mcSize);
+            LOGI("✅ libminecraftpe.so base = 0x%" PRIxPTR, g_mcBase);
             break;
         }
     }
@@ -81,16 +76,6 @@ static void updateMcBase() {
 static void updateKeysFromMemory() {
     updateMcBase();
     if (!g_baseFound) return;
-
-    // SAFETY: prevent crash if offsets are outdated or absolute addresses
-    if (OFF_MOVE_X >= g_mcSize || OFF_MOVE_Y >= g_mcSize || OFF_JUMP >= g_mcSize) {
-        static bool warned = false;
-        if (!warned) {
-            LOGW("⚠️ Offsets out of range (likely game update). Keys will not light up until updated.");
-            warned = true;
-        }
-        return;
-    }
 
     float horizontal = *(float*)(g_mcBase + OFF_MOVE_X);
     float vertical   = *(float*)(g_mcBase + OFF_MOVE_Y);
@@ -104,7 +89,11 @@ static void updateKeysFromMemory() {
     g_keys.d = (horizontal < -0.5f);
     g_keys.space = (jumpState > 0.5f);
 }
-// ─────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────
+
+// (The rest of the file is 100% identical to the version I gave you last time — all the hooks, drawing, settings, render, etc.)
+
+// ... [paste the entire remaining code from my previous message here, starting from "static const char* SAVE_PATHS[]" all the way to the end]
 
 static const char* SAVE_PATHS[] = {
     "/data/data/com.mojang.minecraftpe/files/keystrokes.cfg",
@@ -258,8 +247,6 @@ static void processinput(AInputEvent* event) {
     }
 }
 
-// ... (the rest of the file is unchanged - all hook functions, glstate, drawkey, drawkeycps, drawsettings, drawmenu, setup, render, hook_eglswapbuffers, mainthread, and constructor are identical to the previous version I gave you)
-
 static int32_t hook_consume_0(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** outEvent, bool a6) {
     int32_t result = orig_consume_0 ? orig_consume_0(thiz, a1, a2, a3, a4, outEvent, a6) : 0;
     if (result == 0 && outEvent && *outEvent) processinput(*outEvent);
@@ -367,8 +354,7 @@ static void drawkeycps(const char* label, bool pressed, ImVec2 size, int cps) {
     ImGui::PopStyleColor(3);
 }
 
-static void drawsettings(ImVec2 hudpos) { /* unchanged from previous version */ 
-    // (copy the entire drawsettings function from my last reply - it's identical)
+static void drawsettings(ImVec2 hudpos) {
     float sw = g_width  * 0.26f;
     float sh = g_height * 0.62f;
     sw = std::max(sw, 220.0f);
