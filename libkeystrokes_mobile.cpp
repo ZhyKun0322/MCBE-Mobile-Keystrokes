@@ -23,7 +23,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
-#define VERSION "1.2.1"
+#define VERSION "1.2.2-safe"
 
 struct KeyState {
     bool w = false, a = false, s = false, d = false;
@@ -47,39 +47,50 @@ static bool  g_showsettings = false;
 static ImVec2 g_hudpos      = ImVec2(100, 100);
 static bool  g_posloaded    = false;
 
-// ── MEMORY SCANNER (Mobile-only fix) ─────────────────────────────────────
+// ── SAFE MEMORY SCANNER (Mobile-only) ───────────────────────────────────
 static uintptr_t g_mcBase = 0;
+static uintptr_t g_mcSize = 0;        // ← NEW: module size for safety check
 static bool g_baseFound = false;
 
-// Hardcoded offsets for current Minecraft Bedrock (libminecraftpe.so)
-static const uintptr_t OFF_MOVE_X = 0xC7446130; // Horizontal (A/D)
-static const uintptr_t OFF_MOVE_Y = 0xC7446134; // Vertical (W/S)
-static const uintptr_t OFF_JUMP   = 0xD41BF62C; // Jump (Space)
+// Hardcoded offsets (these are the ones from your screenshots)
+static const uintptr_t OFF_MOVE_X = 0xC7446130;
+static const uintptr_t OFF_MOVE_Y = 0xC7446134;
+static const uintptr_t OFF_JUMP   = 0xD41BF62C;
 
-static uintptr_t getModuleBase(const char* moduleName) {
-    uintptr_t base = 0;
+static void updateMcBase() {
+    if (g_baseFound) return;
+
     FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) return 0;
+    if (!f) return;
+
     char line[512];
     while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, moduleName)) {
-            sscanf(line, "%" PRIxPTR, &base);
+        if (strstr(line, "libminecraftpe.so")) {
+            uintptr_t start = 0, end = 0;
+            sscanf(line, "%" PRIxPTR "-%" PRIxPTR, &start, &end);
+            g_mcBase = start;
+            g_mcSize = end - start;
+            g_baseFound = true;
+            LOGI("✅ libminecraftpe.so found | base=0x%" PRIxPTR " | size=0x%" PRIxPTR, g_mcBase, g_mcSize);
             break;
         }
     }
     fclose(f);
-    return base;
-}
-
-static void updateMcBase() {
-    if (g_baseFound) return;
-    g_mcBase = getModuleBase("libminecraftpe.so");
-    if (g_mcBase != 0) g_baseFound = true;
 }
 
 static void updateKeysFromMemory() {
     updateMcBase();
     if (!g_baseFound) return;
+
+    // SAFETY: prevent crash if offsets are outdated or absolute addresses
+    if (OFF_MOVE_X >= g_mcSize || OFF_MOVE_Y >= g_mcSize || OFF_JUMP >= g_mcSize) {
+        static bool warned = false;
+        if (!warned) {
+            LOGW("⚠️ Offsets out of range (likely game update). Keys will not light up until updated.");
+            warned = true;
+        }
+        return;
+    }
 
     float horizontal = *(float*)(g_mcBase + OFF_MOVE_X);
     float vertical   = *(float*)(g_mcBase + OFF_MOVE_Y);
@@ -87,15 +98,10 @@ static void updateKeysFromMemory() {
 
     std::lock_guard<std::mutex> lock(g_keymutex);
     
-    // Vertical axis (W/S)
     g_keys.w = (vertical > 0.5f);
     g_keys.s = (vertical < -0.5f);
-
-    // Horizontal axis (A/D) - swap signs if your D-pad is inverted
     g_keys.a = (horizontal > 0.5f);
     g_keys.d = (horizontal < -0.5f);
-
-    // Jump
     g_keys.space = (jumpState > 0.5f);
 }
 // ─────────────────────────────────────────────────────────────────────────
@@ -210,15 +216,12 @@ static bool   g_pressing   = false;
 static double g_pressstart = 0.0;
 static const double LONGPRESS_SEC = 0.5;
 
-// ── MOBILE-ONLY INPUT (no PC keyboard events) ───────────────────────────
 static void processinput(AInputEvent* event) {
     if (g_initialized) ImGui_ImplAndroid_HandleInputEvent(event);
     int32_t type = AInputEvent_getType(event);
 
     std::lock_guard<std::mutex> lock(g_keymutex);
 
-    // ONLY motion events are processed (touch / mouse buttons + UI)
-    // WASD + Space are read directly from game memory (updateKeysFromMemory)
     if (type == AINPUT_EVENT_TYPE_MOTION) {
         int32_t action   = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
         int32_t btnstate = AMotionEvent_getButtonState(event);
@@ -247,14 +250,15 @@ static void processinput(AInputEvent* event) {
                 g_lasttouchy = ty;
                 io.MousePos  = ImVec2(tx, ty);
                 io.MouseWheel += dy * -0.06f;
-            } else if (action == AMOTION_EVENT_ACTION_UP ||
-                       action == AMOTION_EVENT_ACTION_CANCEL) {
+            } else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_CANCEL) {
                 g_touchdown     = false;
                 io.MouseDown[0] = false;
             }
         }
     }
 }
+
+// ... (the rest of the file is unchanged - all hook functions, glstate, drawkey, drawkeycps, drawsettings, drawmenu, setup, render, hook_eglswapbuffers, mainthread, and constructor are identical to the previous version I gave you)
 
 static int32_t hook_consume_0(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** outEvent, bool a6) {
     int32_t result = orig_consume_0 ? orig_consume_0(thiz, a1, a2, a3, a4, outEvent, a6) : 0;
@@ -286,7 +290,6 @@ static int32_t hook_consume_4(void* thiz, void* a1, bool a2, long long a3, AInpu
     return result;
 }
 
-// ── OpenGL state save/restore (unchanged) ───────────────────────────────
 struct glstate {
     GLint prog, tex, atex, abuf, ebuf, vao, fbo, vp[4], sc[4], bsrc, bdst;
     GLboolean blend, cull, depth, scissor;
@@ -315,13 +318,10 @@ static void restoregl(const glstate& s) {
     s.scissor ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
 }
 
-// ── Drawing helpers (unchanged) ─────────────────────────────────────────
 static void drawkey(const char* label, bool pressed, ImVec2 size) {
     float a = g_opacity;
-    ImVec4 color     = pressed ? ImVec4(0.85f, 0.85f, 0.85f, 0.95f*a)
-                               : ImVec4(0.18f, 0.20f, 0.22f, 0.88f*a);
-    ImVec4 textcolor = pressed ? ImVec4(0.05f, 0.05f, 0.05f, a)
-                               : ImVec4(0.90f, 0.90f, 0.90f, a);
+    ImVec4 color     = pressed ? ImVec4(0.85f, 0.85f, 0.85f, 0.95f*a) : ImVec4(0.18f, 0.20f, 0.22f, 0.88f*a);
+    ImVec4 textcolor = pressed ? ImVec4(0.05f, 0.05f, 0.05f, a) : ImVec4(0.90f, 0.90f, 0.90f, a);
     ImGui::PushStyleColor(ImGuiCol_Button,        color);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  color);
@@ -332,10 +332,8 @@ static void drawkey(const char* label, bool pressed, ImVec2 size) {
 
 static void drawkeycps(const char* label, bool pressed, ImVec2 size, int cps) {
     float a = g_opacity;
-    ImVec4 color     = pressed ? ImVec4(0.85f, 0.85f, 0.85f, 0.95f*a)
-                               : ImVec4(0.18f, 0.20f, 0.22f, 0.88f*a);
-    ImVec4 textcolor = pressed ? ImVec4(0.05f, 0.05f, 0.05f, a)
-                               : ImVec4(0.90f, 0.90f, 0.90f, a);
+    ImVec4 color     = pressed ? ImVec4(0.85f, 0.85f, 0.85f, 0.95f*a) : ImVec4(0.18f, 0.20f, 0.22f, 0.88f*a);
+    ImVec4 textcolor = pressed ? ImVec4(0.05f, 0.05f, 0.05f, a) : ImVec4(0.90f, 0.90f, 0.90f, a);
 
     ImGui::PushStyleColor(ImGuiCol_Button,        color);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color);
@@ -344,34 +342,33 @@ static void drawkeycps(const char* label, bool pressed, ImVec2 size, int cps) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImGui::Button("##cpskey", size);
 
-    ImDrawList* dl      = ImGui::GetWindowDrawList();
-    ImFont* fn      = ImGui::GetFont();
-    float       fs      = ImGui::GetFontSize();
-    float       smallfs = fs * 0.75f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImFont* fn = ImGui::GetFont();
+    float fs = ImGui::GetFontSize();
+    float smallfs = fs * 0.75f;
 
-    ImVec2 labelSz = fn->CalcTextSizeA(fs,      FLT_MAX, 0.0f, label);
-    char   cpsbuf[16];
+    ImVec2 labelSz = fn->CalcTextSizeA(fs, FLT_MAX, 0.0f, label);
+    char cpsbuf[16];
     snprintf(cpsbuf, sizeof(cpsbuf), "%d CPS", cps);
-    ImVec2 cpsSz   = fn->CalcTextSizeA(smallfs, FLT_MAX, 0.0f, cpsbuf);
+    ImVec2 cpsSz = fn->CalcTextSizeA(smallfs, FLT_MAX, 0.0f, cpsbuf);
 
-    float gap      = 3.0f;
-    float blockH   = labelSz.y + gap + cpsSz.y;
+    float gap = 3.0f;
+    float blockH = labelSz.y + gap + cpsSz.y;
     float blockTop = pos.y + (size.y - blockH) * 0.5f;
 
     float lx = pos.x + (size.x - labelSz.x) * 0.5f;
-    dl->AddText(fn, fs, ImVec2(lx, blockTop),
-                ImGui::ColorConvertFloat4ToU32(textcolor), label);
+    dl->AddText(fn, fs, ImVec2(lx, blockTop), ImGui::ColorConvertFloat4ToU32(textcolor), label);
 
-    float  cx     = pos.x + (size.x - cpsSz.x) * 0.5f;
-    float  cy     = blockTop + labelSz.y + gap;
+    float cx = pos.x + (size.x - cpsSz.x) * 0.5f;
+    float cy = blockTop + labelSz.y + gap;
     ImVec4 dimcol = ImVec4(textcolor.x, textcolor.y, textcolor.z, textcolor.w * 0.70f);
-    dl->AddText(fn, smallfs, ImVec2(cx, cy),
-                ImGui::ColorConvertFloat4ToU32(dimcol), cpsbuf);
+    dl->AddText(fn, smallfs, ImVec2(cx, cy), ImGui::ColorConvertFloat4ToU32(dimcol), cpsbuf);
 
     ImGui::PopStyleColor(3);
 }
 
-static void drawsettings(ImVec2 hudpos) {
+static void drawsettings(ImVec2 hudpos) { /* unchanged from previous version */ 
+    // (copy the entire drawsettings function from my last reply - it's identical)
     float sw = g_width  * 0.26f;
     float sh = g_height * 0.62f;
     sw = std::max(sw, 220.0f);
@@ -408,10 +405,7 @@ static void drawsettings(ImVec2 hudpos) {
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,   ImVec2(6.0f, 4.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize,  6.0f);
 
-    ImGui::Begin("##cfg", nullptr,
-        ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoResize   |
-        ImGuiWindowFlags_NoMove);
+    ImGui::Begin("##cfg", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
     float ctrlw = sw - 24.0f;
 
@@ -482,8 +476,7 @@ static void drawsettings(ImVec2 hudpos) {
     }
     ImGui::PopStyleColor(4);
 
-    float remaining = ImGui::GetContentRegionAvail().y
-                    - ImGui::GetTextLineHeightWithSpacing() * 2.5f;
+    float remaining = ImGui::GetContentRegionAvail().y - ImGui::GetTextLineHeightWithSpacing() * 2.5f;
     if (remaining > 0) ImGui::Dummy(ImVec2(0, remaining));
 
     ImGui::Separator();
@@ -513,9 +506,7 @@ static void drawmenu() {
     float ks      = g_keysize;
     float spacing = ks * 0.04f;
     float hudW    = ks * 3 + spacing * 2;
-    float hudH    = ks * 3     + spacing * 2
-                  + ks * 1.5f + spacing
-                  + ks * 0.7f + spacing;
+    float hudH    = ks * 3     + spacing * 2 + ks * 1.5f + spacing + ks * 0.7f + spacing;
 
     ImGuiIO& io = ImGui::GetIO();
     bool isInside = (io.MousePos.x >= g_hudpos.x && io.MousePos.x <= g_hudpos.x + hudW &&
@@ -618,7 +609,6 @@ static void render() {
     ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
     
-    // Mobile fix: read movement keys directly from game memory every frame
     updateKeysFromMemory(); 
     
     drawmenu();
@@ -644,7 +634,6 @@ static void* mainthread(void*) {
 
     GlossInit(true);
 
-    // Hook EGL swap
     GHandle hegl = GlossOpen("libEGL.so");
     void* swap   = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
     if (!swap) {
@@ -653,7 +642,6 @@ static void* mainthread(void*) {
     }
     if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
 
-    // Hook InputConsumer::consume for touch / LMB / RMB / settings UI
     GHandle hlib     = GlossOpen("libinput.so");
     void* symconsume = nullptr;
 
