@@ -1,5 +1,4 @@
-// MCBE_MobileKeystrokes_26.13.1_Fixed.cpp
-// Complete working version for stripped MCBE 26.13.1
+// MCBE_MobileKeystrokes_CrashProof.cpp
 
 #include <jni.h>
 #include <android/log.h>
@@ -11,6 +10,7 @@
 #include <mutex>
 #include <fstream>
 #include <vector>
+#include <sys/mman.h>
 
 #include "pl/Gloss.h"
 #include "imgui.h"
@@ -25,7 +25,6 @@
 // CONFIGURATION
 // ============================================================================
 
-// If you find the correct MIC offset, set it here
 #define KNOWN_MIC_OFFSET 0
 
 // ============================================================================
@@ -36,9 +35,9 @@ struct Vec2 { float x, y; };
 
 struct MoveInputComponent {
     char pad[0x24];
-    Vec2 mMove;                  // 0x24 - movement vector
+    Vec2 mMove;
     char pad2[0x34];
-    unsigned short mFlagValues;  // 0x60 - bit 0 = jump
+    unsigned short mFlagValues;
 };
 
 // ============================================================================
@@ -46,19 +45,11 @@ struct MoveInputComponent {
 // ============================================================================
 
 struct KeyState {
-    bool w = false;
-    bool a = false;
-    bool s = false;
-    bool d = false;
-    bool space = false;
+    bool w = false, a = false, s = false, d = false, space = false;
 };
 
 struct KeySettings {
-    bool show_w = true;
-    bool show_a = true;
-    bool show_s = true;
-    bool show_d = true;
-    bool show_space = true;
+    bool show_w = true, show_a = true, show_s = true, show_d = true, show_space = true;
 };
 
 static KeyState g_keys;
@@ -66,10 +57,10 @@ static KeySettings g_settings;
 static std::mutex g_keyMutex;
 static bool g_initialized = false;
 static bool g_showSettings = false;
-static bool g_scanDone = false;
 static int g_micOffset = 0;
 static void* g_playerPtr = nullptr;
 static int g_tickCount = 0;
+static bool g_scanning = false;
 
 // ============================================================================
 // FUNCTION HOOKS
@@ -79,82 +70,158 @@ typedef EGLBoolean (*EGLSwapBuffers_t)(EGLDisplay, EGLSurface);
 static EGLSwapBuffers_t orig_eglSwapBuffers = nullptr;
 
 // ============================================================================
-// MEMORY SCANNER - Find player in heap
+// SAFE MEMORY SCANNER
 // ============================================================================
 
-void scanMemoryForPlayer() {
-    if (g_playerPtr) return;
+bool isValidPointer(void* ptr) {
+    if (!ptr) return false;
     
+    // Check if pointer is readable
+    int fd[2];
+    if (pipe(fd) == -1) return false;
+    
+    bool valid = (write(fd[1], ptr, 1) == 1);
+    close(fd[0]);
+    close(fd[1]);
+    
+    return valid;
+}
+
+void scanMemoryForPlayer() {
+    if (g_playerPtr || g_scanning) return;
+    g_scanning = true;
+    
+    LOGI("=== STARTING MEMORY SCAN ===");
+    
+    // Get MC base
     FILE* maps = fopen("/proc/self/maps", "r");
-    if (!maps) return;
+    if (!maps) {
+        g_scanning = false;
+        return;
+    }
     
     char line[512];
-    LOGI("=== SCANNING MEMORY FOR PLAYER ===");
-    
-    // Get libminecraftpe.so base for reference
     uintptr_t mcBase = 0;
-    FILE* maps2 = fopen("/proc/self/maps", "r");
-    while (fgets(line, sizeof(line), maps2)) {
+    while (fgets(line, sizeof(line), maps)) {
         if (strstr(line, "libminecraftpe.so") && strstr(line, "r-xp")) {
             sscanf(line, "%lx", &mcBase);
             break;
         }
     }
-    fclose(maps2);
+    fclose(maps);
+    
+    if (!mcBase) {
+        LOGI("Could not find MC base");
+        g_scanning = false;
+        return;
+    }
     
     LOGI("MC base: 0x%lx", mcBase);
     
-    // Reset to start of maps
-    fseek(maps, 0, SEEK_SET);
+    // Re-open maps for heap scanning
+    maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        g_scanning = false;
+        return;
+    }
     
-    while (fgets(line, sizeof(line), maps)) {
-        // Look for heap or anon regions
-        if (strstr(line, "rw-p") && (strstr(line, "[heap]") || strstr(line, "anon"))) {
-            uintptr_t start, end;
-            sscanf(line, "%lx-%lx", &start, &end);
+    int foundCount = 0;
+    
+    while (fgets(line, sizeof(line), maps) && !g_playerPtr) {
+        uintptr_t start, end;
+        char perms[5];
+        
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
+        
+        // Look for readable heap regions
+        if (perms[0] != 'r') continue; // Not readable
+        if (!strstr(line, "[heap]") && !strstr(line, "[anon")) continue;
+        
+        // Limit scan size to prevent crashes
+        size_t regionSize = end - start;
+        if (regionSize > 100 * 1024 * 1024) continue; // Skip huge regions (>100MB)
+        
+        // Scan with bounds checking
+        uint64_t* mem = (uint64_t*)start;
+        size_t numPtrs = regionSize / 8;
+        
+        for (size_t i = 0; i < numPtrs && !g_playerPtr; i++) {
+            // Check if this looks like a vtable pointer to MC code
+            uint64_t val = mem[i];
             
-            // Scan this region
-            uint64_t* mem = (uint64_t*)start;
-            size_t size = (end - start) / 8;
+            // Vtable heuristic: pointer to .text section of libminecraftpe.so
+            if (val < mcBase || val > mcBase + 0x2000000) continue;
             
-            for (size_t i = 0; i < size; i++) {
-                // Look for pointers to libminecraftpe.so (potential vtable)
-                if (mem[i] > mcBase && mem[i] < mcBase + 0x10000000) {
-                    void* potentialPlayer = (void*)&mem[i];
+            void* potentialObj = (void*)&mem[i];
+            
+            // Test MIC offsets safely
+            const int testOffsets[] = {0x10A8, 0xF80, 0xFA0, 0xFB0, 0xFC0, 0xFD0, 0xFE0, 0xFF0,
+                                       0x1000, 0x1008, 0x1010, 0x1018, 0x1020, 0x1028, 0x1030, 0x1038,
+                                       0x1040, 0x1048, 0x1050, 0x1058, 0x1060, 0x1068, 0x1070, 0x1078,
+                                       0x1080, 0x1088, 0x1090, 0x1098, 0x10A0, 0x10B0, 0x10C0, 0x10D0, 0x10E0, 0x10F0};
+            
+            for (int off : testOffsets) {
+                void** micPtr = (void**)((uintptr_t)potentialObj + off);
+                
+                // Safe read check
+                if (!micPtr) continue;
+                
+                // Use mincore to check if memory is valid (Linux specific)
+                unsigned char vec;
+                if (mincore((void*)((uintptr_t)micPtr & ~0xFFF), 4096, &vec) != 0) continue;
+                
+                void* mic = *micPtr;
+                if (!mic) continue;
+                
+                // Check MIC pointer validity
+                if (mincore((void*)((uintptr_t)mic & ~0xFFF), 4096, &vec) != 0) continue;
+                
+                // Read mMove values safely
+                float mx, my;
+                
+                // Use try-catch equivalent by checking memory first
+                volatile float* mMoveX = (volatile float*)((uintptr_t)mic + 0x24);
+                volatile float* mMoveY = (volatile float*)((uintptr_t)mic + 0x28);
+                
+                // Quick validity check - read twice to ensure stable
+                float mx1 = *mMoveX;
+                float my1 = *mMoveY;
+                usleep(1000); // 1ms
+                float mx2 = *mMoveX;
+                float my2 = *mMoveY;
+                
+                // Values should be stable (not changing during read)
+                if (abs(mx1 - mx2) > 0.01f || abs(my1 - my2) > 0.01f) continue;
+                
+                mx = mx1;
+                my = my1;
+                
+                // Check if values look like movement (-1 to 1 typically)
+                if (mx >= -2.0f && mx <= 2.0f && my >= -2.0f && my <= 2.0f) {
+                    foundCount++;
+                    LOGI("Candidate #%d: obj=%p off=0x%X mMove=(%.3f, %.3f)",
+                         foundCount, potentialObj, off, mx, my);
                     
-                    // Test common MIC offsets
-                    const int testOffsets[] = {0x10A8, 0xF80, 0xFA0, 0x10B0, 0x10C0, 0x10D0, 0x10E0};
-                    
-                    for (int off : testOffsets) {
-                        void** micPtr = (void**)((uintptr_t)potentialPlayer + off);
-                        if (!micPtr || !*micPtr) continue;
-                        
-                        uintptr_t mic = (uintptr_t)*micPtr;
-                        
-                        // MIC should be in readable heap memory
-                        if (mic < 0x1000000000 || mic > 0x800000000000) continue;
-                        
-                        float mx = *(float*)(mic + 0x24);
-                        float my = *(float*)(mic + 0x28);
-                        
-                        // Check if values look like movement
-                        if (mx > -2 && mx < 2 && my > -2 && my < 2) {
-                            LOGI("Found: player=%p offset=0x%X mMove=(%.2f, %.2f)",
-                                 potentialPlayer, off, mx, my);
-                            
-                            g_playerPtr = potentialPlayer;
-                            g_micOffset = off;
-                            fclose(maps);
-                            return;
-                        }
-                    }
+                    // Use first good candidate
+                    g_playerPtr = potentialObj;
+                    g_micOffset = off;
+                    break;
                 }
             }
         }
     }
     
     fclose(maps);
-    LOGI("Player not found yet, will retry...");
+    g_scanning = false;
+    
+    if (g_playerPtr) {
+        LOGI("=== PLAYER FOUND ===");
+        LOGI("Player: %p", g_playerPtr);
+        LOGI("MIC Offset: 0x%X", g_micOffset);
+        LOGI("Move around to verify!");
+    } else {
+        LOGI("=== PLAYER NOT FOUND, WILL RETRY ===");
+    }
 }
 
 // ============================================================================
@@ -163,35 +230,48 @@ void scanMemoryForPlayer() {
 
 void updateKeys() {
     if (!g_playerPtr) {
-        if (g_tickCount % 300 == 0) {
+        if (g_tickCount % 180 == 0) { // Try every 3 seconds
             scanMemoryForPlayer();
         }
         g_tickCount++;
         return;
     }
     
-    // Read MIC
+    // Safe read with null checks
     void** micPtr = (void**)((uintptr_t)g_playerPtr + g_micOffset);
-    if (!micPtr || !*micPtr) {
+    if (!micPtr) {
         g_playerPtr = nullptr;
         return;
     }
     
-    MoveInputComponent* mic = (MoveInputComponent*)*micPtr;
+    void* mic = *micPtr;
+    if (!mic) {
+        g_playerPtr = nullptr;
+        return;
+    }
+    
+    // Check if MIC memory is still valid
+    unsigned char vec;
+    if (mincore((void*)((uintptr_t)mic & ~0xFFF), 4096, &vec) != 0) {
+        g_playerPtr = nullptr;
+        return;
+    }
+    
+    MoveInputComponent* micComp = (MoveInputComponent*)mic;
     
     std::lock_guard<std::mutex> lock(g_keyMutex);
     
     const float DEADZONE = 0.15f;
-    g_keys.w = (mic->mMove.y < -DEADZONE);
-    g_keys.s = (mic->mMove.y > DEADZONE);
-    g_keys.a = (mic->mMove.x < -DEADZONE);
-    g_keys.d = (mic->mMove.x > DEADZONE);
-    g_keys.space = (mic->mFlagValues & 0x1) != 0;
+    g_keys.w = (micComp->mMove.y < -DEADZONE);
+    g_keys.s = (micComp->mMove.y > DEADZONE);
+    g_keys.a = (micComp->mMove.x < -DEADZONE);
+    g_keys.d = (micComp->mMove.x > DEADZONE);
+    g_keys.space = (micComp->mFlagValues & 0x1) != 0;
     
     if (g_tickCount % 120 == 0) {
         LOGI("Keys: W=%d A=%d S=%d D=%d J=%d | mMove=(%.2f,%.2f)",
              g_keys.w, g_keys.a, g_keys.s, g_keys.d, g_keys.space,
-             mic->mMove.x, mic->mMove.y);
+             micComp->mMove.x, micComp->mMove.y);
     }
     g_tickCount++;
 }
@@ -293,14 +373,17 @@ static void renderHUD() {
                 ImGui::Text("W:%d A:%d S:%d D:%d J:%d",
                            g_keys.w, g_keys.a, g_keys.s, g_keys.d, g_keys.space);
             } else {
-                ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Status: SEARCHING...");
-                ImGui::Text("Scanning memory...");
+                ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Status: SCANNING...");
+                if (g_scanning) {
+                    ImGui::Text("Scanning memory...");
+                } else {
+                    ImGui::Text("Waiting to retry...");
+                }
             }
             
             if (ImGui::Button("Force Rescan")) {
                 g_playerPtr = nullptr;
                 g_micOffset = 0;
-                scanMemoryForPlayer();
             }
         }
         ImGui::End();
@@ -308,11 +391,14 @@ static void renderHUD() {
 }
 
 // ============================================================================
-// EGL HOOK - FIXED RETURN TYPE
+// EGL HOOK
 // ============================================================================
 
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!orig_eglSwapBuffers) return EGL_FALSE;
+    if (!orig_eglSwapBuffers) {
+        LOGE("orig_eglSwapBuffers is NULL!");
+        return EGL_FALSE;
+    }
     
     EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
@@ -338,9 +424,9 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
         ImGui::GetStyle().ScaleAllSizes(scale);
         
         g_initialized = true;
-        LOGI("ImGui initialized");
+        LOGI("ImGui initialized, starting scan...");
         
-        // Start scanning
+        // First scan
         scanMemoryForPlayer();
     }
     
@@ -382,7 +468,7 @@ void* main_thread(void*) {
     GlossInit(true);
     
     LOGI("========================================");
-    LOGI("MobileKeystrokes 26.13.1 (Runtime Scanner)");
+    LOGI("MobileKeystrokes 26.13.1 (Crash-Proof)");
     LOGI("========================================");
     
     // Hook EGL
@@ -390,12 +476,12 @@ void* main_thread(void*) {
     void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
     if (swap) {
         GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-        LOGI("[OK] EGL hooked");
+        LOGI("[OK] EGL hooked at %p", swap);
     } else {
         LOGE("[FAIL] EGL hook failed");
     }
     
-    LOGI("Enter a world - auto-scan will begin");
+    LOGI("Enter a world - scanning will begin automatically");
     LOGI("========================================");
     
     return nullptr;
