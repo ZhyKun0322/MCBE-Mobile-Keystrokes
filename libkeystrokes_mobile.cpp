@@ -17,15 +17,30 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  1. Taco's MoveInputComponent layout (unchanged)
+//  1. Taco's MoveInputComponent layout (from screenshot, 26.13.1)
 // ─────────────────────────────────────────────────────────────────────────────
 struct Vec2 { float x, y; };
+struct Vec3 { float x, y, z; };
+
+// MoveInputState occupies 0x10 bytes (two of them back-to-back)
+struct MoveInputState {
+    char data[0x10];
+};
 
 struct MoveInputComponent {
-    char          filler0[0x24];     // 0x00 – 0x23
-    Vec2          mMove;             // 0x24  movement stick
-    char          filler1[0x34];     // 0x2C – 0x5F
-    unsigned short mFlagValues;      // 0x60  bitset (bit 0 = jump)
+    MoveInputState  mInputState;            // [0x00] processed input state
+    MoveInputState  mRawInputState;         // [0x10] RAW input state (D-pad/touch)
+    uint8_t         mHoldAutoJumpInWaterTicks; // [0x20]
+    char            pad[0x3];              // align to 0x24
+    Vec2            mMove;                 // [0x24] movement vector
+    Vec2            mLookDelta;            // [0x2C]
+    Vec2            mInteractDir;          // [0x34]
+    char            pad2[0x4];             // align to 0x3C
+    Vec3            mDisplacement;         // [0x3C]
+    Vec3            mDisplacementDelta;    // [0x48]
+    Vec3            mCameraOrientation;    // [0x54]
+    unsigned short  mFlagValues;           // [0x60] brstd::bitset<11,ushort> — bit 0 = jump
+    bool            mIsPaddling[2];        // [0x61]
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,10 +68,16 @@ static bool        g_initialized   = false;
 static bool        g_show_settings = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  3. NormalTick hook — WASD + SPACE  (Taco's logic, unchanged)
+//  3. NormalTick hook — WASD + SPACE
+//     mMove at [0x24] reflects the FINAL movement vector (works for joystick).
+//     For D-pad/touch, mRawInputState at [0x10] holds the unprocessed state.
+//     We read mMove for direction and mFlagValues for jump — both confirmed
+//     by Taco's struct dump for 26.13.1.
 // ─────────────────────────────────────────────────────────────────────────────
 typedef void (*NormalTick_t)(void*);
 static NormalTick_t orig_NormalTick = nullptr;
+
+static int g_tick_count = 0;
 
 void hook_NormalTick(void* player) {
     if (player) {
@@ -65,11 +86,24 @@ void hook_NormalTick(void* player) {
 
         if (mic) {
             std::lock_guard<std::mutex> lock(g_keymutex);
+
+            // mMove [0x24]: x = strafe, y = forward
+            // Positive y = forward (W), negative y = backward (S)
+            // Positive x = right (D),  negative x = left (A)
             g_keys.w     = (mic->mMove.y >  0.1f);
             g_keys.s     = (mic->mMove.y < -0.1f);
             g_keys.d     = (mic->mMove.x >  0.1f);
             g_keys.a     = (mic->mMove.x < -0.1f);
+
+            // mFlagValues [0x60]: bit 0 = jump
             g_keys.space = (mic->mFlagValues & 0x1) != 0;
+
+            // Debug: log every 60 ticks so we can verify values in logcat
+            if (++g_tick_count % 60 == 0) {
+                LOGI("mMove=(%.2f,%.2f) flags=0x%X w=%d a=%d s=%d d=%d space=%d",
+                     mic->mMove.x, mic->mMove.y, mic->mFlagValues,
+                     g_keys.w, g_keys.a, g_keys.s, g_keys.d, g_keys.space);
+            }
         }
     }
     if (orig_NormalTick) orig_NormalTick(player);
