@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <inttypes.h>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -18,15 +19,15 @@
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-#define LOG_TAG "KeystrokesMobile"
+#define LOG_TAG "Keystrokes"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
-#define VERSION "2.0.0" // Updated for mobile memory release
+#define VERSION "1.2.1"
 
 struct KeyState {
     bool w = false, a = false, s = false, d = false;
-    bool space = false;
+    bool space = false, lmb = false, rmb = false;
 };
 
 static KeyState g_keys;
@@ -37,7 +38,6 @@ static int g_width = 0, g_height = 0;
 static float g_uiscale = 1.0f;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
-static uintptr_t g_mcBase = 0;
 
 static float g_keysize      = 50.0f;
 static float g_opacity      = 1.0f;
@@ -47,9 +47,62 @@ static bool  g_showsettings = false;
 static ImVec2 g_hudpos      = ImVec2(100, 100);
 static bool  g_posloaded    = false;
 
+// ── MEMORY SCANNER (Mobile-only fix) ─────────────────────────────────────
+static uintptr_t g_mcBase = 0;
+static bool g_baseFound = false;
+
+// Hardcoded offsets for current Minecraft Bedrock (libminecraftpe.so)
+static const uintptr_t OFF_MOVE_X = 0xC7446130; // Horizontal (A/D)
+static const uintptr_t OFF_MOVE_Y = 0xC7446134; // Vertical (W/S)
+static const uintptr_t OFF_JUMP   = 0xD41BF62C; // Jump (Space)
+
+static uintptr_t getModuleBase(const char* moduleName) {
+    uintptr_t base = 0;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, moduleName)) {
+            sscanf(line, "%" PRIxPTR, &base);
+            break;
+        }
+    }
+    fclose(f);
+    return base;
+}
+
+static void updateMcBase() {
+    if (g_baseFound) return;
+    g_mcBase = getModuleBase("libminecraftpe.so");
+    if (g_mcBase != 0) g_baseFound = true;
+}
+
+static void updateKeysFromMemory() {
+    updateMcBase();
+    if (!g_baseFound) return;
+
+    float horizontal = *(float*)(g_mcBase + OFF_MOVE_X);
+    float vertical   = *(float*)(g_mcBase + OFF_MOVE_Y);
+    float jumpState  = *(float*)(g_mcBase + OFF_JUMP);
+
+    std::lock_guard<std::mutex> lock(g_keymutex);
+    
+    // Vertical axis (W/S)
+    g_keys.w = (vertical > 0.5f);
+    g_keys.s = (vertical < -0.5f);
+
+    // Horizontal axis (A/D) - swap signs if your D-pad is inverted
+    g_keys.a = (horizontal > 0.5f);
+    g_keys.d = (horizontal < -0.5f);
+
+    // Jump
+    g_keys.space = (jumpState > 0.5f);
+}
+// ─────────────────────────────────────────────────────────────────────────
+
 static const char* SAVE_PATHS[] = {
-    "/data/data/com.mojang.minecraftpe/files/keystrokes_mobile.cfg",
-    "/data/data/com.mojang.minecraftpe.preview/files/keystrokes_mobile.cfg",
+    "/data/data/com.mojang.minecraftpe/files/keystrokes.cfg",
+    "/data/data/com.mojang.minecraftpe.preview/files/keystrokes.cfg",
     nullptr
 };
 
@@ -82,6 +135,34 @@ static double nowsec() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
+
+struct CpsTracker {
+    static const int MAX_CLICKS = 64;
+    double times[MAX_CLICKS] = {};
+    int    head  = 0;
+    int    count = 0;
+
+    void click() {
+        times[head] = nowsec();
+        head = (head + 1) % MAX_CLICKS;
+        if (count < MAX_CLICKS) count++;
+    }
+
+    int get() {
+        double now    = nowsec();
+        double cutoff = now - 1.0;
+        int    n      = 0;
+        for (int i = 0; i < count; i++) {
+            int idx = (head - 1 - i + MAX_CLICKS) % MAX_CLICKS;
+            if (times[idx] >= cutoff) n++;
+            else break;
+        }
+        return n;
+    }
+};
+
+static CpsTracker g_lmbcps, g_rmbcps;
+static bool g_prevlmb = false, g_prevrmb = false;
 
 static float g_lasttouchy = 0.0f;
 static bool  g_touchdown  = false;
@@ -129,14 +210,28 @@ static bool   g_pressing   = false;
 static double g_pressstart = 0.0;
 static const double LONGPRESS_SEC = 0.5;
 
-// ONLY handles touch input for ImGui. Keyboard tracking removed.
+// ── MOBILE-ONLY INPUT (no PC keyboard events) ───────────────────────────
 static void processinput(AInputEvent* event) {
     if (g_initialized) ImGui_ImplAndroid_HandleInputEvent(event);
     int32_t type = AInputEvent_getType(event);
 
+    std::lock_guard<std::mutex> lock(g_keymutex);
+
+    // ONLY motion events are processed (touch / mouse buttons + UI)
+    // WASD + Space are read directly from game memory (updateKeysFromMemory)
     if (type == AINPUT_EVENT_TYPE_MOTION) {
-        int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
-        
+        int32_t action   = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+        int32_t btnstate = AMotionEvent_getButtonState(event);
+
+        bool newlmb = (btnstate & AMOTION_EVENT_BUTTON_PRIMARY)   != 0;
+        bool newrmb = (btnstate & AMOTION_EVENT_BUTTON_SECONDARY) != 0;
+        if (newlmb && !g_prevlmb) g_lmbcps.click();
+        if (newrmb && !g_prevrmb) g_rmbcps.click();
+        g_prevlmb  = newlmb;
+        g_prevrmb  = newrmb;
+        g_keys.lmb = newlmb;
+        g_keys.rmb = newrmb;
+
         if (g_initialized && g_showsettings) {
             float tx = AMotionEvent_getX(event, 0);
             float ty = AMotionEvent_getY(event, 0);
@@ -166,27 +261,32 @@ static int32_t hook_consume_0(void* thiz, void* a1, bool a2, long a3, uint32_t* 
     if (result == 0 && outEvent && *outEvent) processinput(*outEvent);
     return result;
 }
+
 static int32_t hook_consume_1(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** outEvent) {
     int32_t result = orig_consume_1 ? orig_consume_1(thiz, a1, a2, a3, a4, outEvent) : 0;
     if (result == 0 && outEvent && *outEvent) processinput(*outEvent);
     return result;
 }
+
 static int32_t hook_consume_2(void* thiz, void* a1, bool a2, long long a3, uint32_t* a4, AInputEvent** outEvent) {
     int32_t result = orig_consume_2 ? orig_consume_2(thiz, a1, a2, a3, a4, outEvent) : 0;
     if (result == 0 && outEvent && *outEvent) processinput(*outEvent);
     return result;
 }
+
 static int32_t hook_consume_3(void* thiz, void* a1, bool a2, long long a3, AInputEvent** outEvent, uint32_t* a4) {
     int32_t result = orig_consume_3 ? orig_consume_3(thiz, a1, a2, a3, outEvent, a4) : 0;
     if (result == 0 && outEvent && *outEvent) processinput(*outEvent);
     return result;
 }
+
 static int32_t hook_consume_4(void* thiz, void* a1, bool a2, long long a3, AInputEvent** outEvent, uint32_t* a4, bool a6) {
     int32_t result = orig_consume_4 ? orig_consume_4(thiz, a1, a2, a3, outEvent, a4, a6) : 0;
     if (result == 0 && outEvent && *outEvent) processinput(*outEvent);
     return result;
 }
 
+// ── OpenGL state save/restore (unchanged) ───────────────────────────────
 struct glstate {
     GLint prog, tex, atex, abuf, ebuf, vao, fbo, vp[4], sc[4], bsrc, bdst;
     GLboolean blend, cull, depth, scissor;
@@ -215,44 +315,7 @@ static void restoregl(const glstate& s) {
     s.scissor ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
 }
 
-// Function to find libminecraftpe.so base address
-static uintptr_t GetMinecraftBase() {
-    uintptr_t base = 0;
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (fp) {
-        char line[512];
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "libminecraftpe.so") && strstr(line, "r-xp")) {
-                sscanf(line, "%lx", &base);
-                break;
-            }
-        }
-        fclose(fp);
-    }
-    return base;
-}
-
-// Memory reader function updating g_keys based on your offsets
-static void UpdateKeysFromMemory() {
-    if (g_mcBase == 0) {
-        g_mcBase = GetMinecraftBase();
-        return; // Try again next frame if not found
-    }
-
-    // Safely cast the calculated addresses to float pointers and read
-    float vertical   = *(float*)(g_mcBase + 0x1B98304);
-    float horizontal = *(float*)(g_mcBase + 0x2C09D3F0);
-    float jumpState  = *(float*)(g_mcBase - 0x2309F70C);
-
-    std::lock_guard<std::mutex> lock(g_keymutex);
-    // Using 0.5f threshold to account for slight analog inputs
-    g_keys.w = (vertical >= 0.5f);
-    g_keys.s = (vertical <= -0.5f);
-    g_keys.a = (horizontal >= 0.5f);
-    g_keys.d = (horizontal <= -0.5f);
-    g_keys.space = (jumpState >= 0.5f);
-}
-
+// ── Drawing helpers (unchanged) ─────────────────────────────────────────
 static void drawkey(const char* label, bool pressed, ImVec2 size) {
     float a = g_opacity;
     ImVec4 color     = pressed ? ImVec4(0.85f, 0.85f, 0.85f, 0.95f*a)
@@ -265,6 +328,47 @@ static void drawkey(const char* label, bool pressed, ImVec2 size) {
     ImGui::PushStyleColor(ImGuiCol_Text,          textcolor);
     ImGui::Button(label, size);
     ImGui::PopStyleColor(4);
+}
+
+static void drawkeycps(const char* label, bool pressed, ImVec2 size, int cps) {
+    float a = g_opacity;
+    ImVec4 color     = pressed ? ImVec4(0.85f, 0.85f, 0.85f, 0.95f*a)
+                               : ImVec4(0.18f, 0.20f, 0.22f, 0.88f*a);
+    ImVec4 textcolor = pressed ? ImVec4(0.05f, 0.05f, 0.05f, a)
+                               : ImVec4(0.90f, 0.90f, 0.90f, a);
+
+    ImGui::PushStyleColor(ImGuiCol_Button,        color);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  color);
+
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::Button("##cpskey", size);
+
+    ImDrawList* dl      = ImGui::GetWindowDrawList();
+    ImFont* fn      = ImGui::GetFont();
+    float       fs      = ImGui::GetFontSize();
+    float       smallfs = fs * 0.75f;
+
+    ImVec2 labelSz = fn->CalcTextSizeA(fs,      FLT_MAX, 0.0f, label);
+    char   cpsbuf[16];
+    snprintf(cpsbuf, sizeof(cpsbuf), "%d CPS", cps);
+    ImVec2 cpsSz   = fn->CalcTextSizeA(smallfs, FLT_MAX, 0.0f, cpsbuf);
+
+    float gap      = 3.0f;
+    float blockH   = labelSz.y + gap + cpsSz.y;
+    float blockTop = pos.y + (size.y - blockH) * 0.5f;
+
+    float lx = pos.x + (size.x - labelSz.x) * 0.5f;
+    dl->AddText(fn, fs, ImVec2(lx, blockTop),
+                ImGui::ColorConvertFloat4ToU32(textcolor), label);
+
+    float  cx     = pos.x + (size.x - cpsSz.x) * 0.5f;
+    float  cy     = blockTop + labelSz.y + gap;
+    ImVec4 dimcol = ImVec4(textcolor.x, textcolor.y, textcolor.z, textcolor.w * 0.70f);
+    dl->AddText(fn, smallfs, ImVec2(cx, cy),
+                ImGui::ColorConvertFloat4ToU32(dimcol), cpsbuf);
+
+    ImGui::PopStyleColor(3);
 }
 
 static void drawsettings(ImVec2 hudpos) {
@@ -316,10 +420,10 @@ static void drawsettings(ImVec2 hudpos) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (g_mcBase != 0)
-        ImGui::TextColored(ImVec4(0.40f, 0.80f, 0.40f, 1.0f), "Memory Reader: Active");
+    if (g_consume_variant >= 0)
+        ImGui::TextColored(ImVec4(0.40f, 0.80f, 0.40f, 1.0f), "Hook: variant %d (OK)", g_consume_variant);
     else
-        ImGui::TextColored(ImVec4(1.00f, 0.35f, 0.35f, 1.0f), "Memory Reader: Locating...");
+        ImGui::TextColored(ImVec4(1.00f, 0.35f, 0.35f, 1.0f), "Hook: NOT FOUND");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -356,7 +460,7 @@ static void drawsettings(ImVec2 hudpos) {
     bool locked = g_locked;
     if (ImGui::Checkbox("##lk", &locked)) { g_locked = locked; savecfg(); }
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.55f, 0.62f, 0.75f, 1.0f), "Prevent drag & move");
+    ImGui::TextColored(ImVec4(0.55f, 0.62f, 0.75f, 1.0f), "Prevent drag & accidental move");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -400,16 +504,18 @@ static void drawsettings(ImVec2 hudpos) {
 }
 
 static void drawmenu() {
-    UpdateKeysFromMemory(); // Read from memory before drawing!
-    
     KeyState k;
     { std::lock_guard<std::mutex> lock(g_keymutex); k = g_keys; }
+
+    int lmbcps = g_lmbcps.get();
+    int rmbcps = g_rmbcps.get();
 
     float ks      = g_keysize;
     float spacing = ks * 0.04f;
     float hudW    = ks * 3 + spacing * 2;
-    // Adjusted height since LMB/RMB were removed
-    float hudH    = ks * 2.7f + spacing * 2;
+    float hudH    = ks * 3     + spacing * 2
+                  + ks * 1.5f + spacing
+                  + ks * 0.7f + spacing;
 
     ImGuiIO& io = ImGui::GetIO();
     bool isInside = (io.MousePos.x >= g_hudpos.x && io.MousePos.x <= g_hudpos.x + hudW &&
@@ -455,6 +561,10 @@ static void drawmenu() {
     drawkey("S", k.s, ImVec2(ks, ks)); ImGui::SameLine();
     drawkey("D", k.d, ImVec2(ks, ks));
 
+    float half = (hudW - spacing) / 2.0f;
+    drawkeycps("LMB", k.lmb, ImVec2(half, ks * 1.5f), lmbcps); ImGui::SameLine();
+    drawkeycps("RMB", k.rmb, ImVec2(half, ks * 1.5f), rmbcps);
+
     drawkey("_____", k.space, ImVec2(hudW, ks * 0.7f));
 
     ImGui::PopStyleVar(3);
@@ -489,6 +599,13 @@ static void setup() {
     style.ScaleAllSizes(dpscale);
     style.WindowBorderSize = 0.0f;
 
+    float ks      = g_keysize;
+    float spacing = ks * 0.04f;
+    float hudW    = ks * 3 + spacing * 2;
+    float hudH    = ks * 4 + spacing * 3;
+    g_hudpos.x = std::max(0.0f, std::min(g_hudpos.x, (float)g_width  - hudW));
+    g_hudpos.y = std::max(0.0f, std::min(g_hudpos.y, (float)g_height - hudH));
+
     g_initialized = true;
 }
 
@@ -500,6 +617,10 @@ static void render() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
+    
+    // Mobile fix: read movement keys directly from game memory every frame
+    updateKeysFromMemory(); 
+    
     drawmenu();
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -514,39 +635,25 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
     if (w < 500 || h < 500) return orig_eglswapbuffers(dpy, surf);
     if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
-    if (ctx == g_targetcontext && surf == g_targetsurface) { 
-        g_width = w; 
-        g_height = h; 
-        setup();   // Initialize ImGui if not already done
-        render();  // Draw the keystrokes
-    }
-
+    if (ctx == g_targetcontext && surf == g_targetsurface) { g_width = w; g_height = h; setup(); render(); }
     return orig_eglswapbuffers(dpy, surf);
 }
 
 static void* mainthread(void*) {
-    // Wait for the game to fully load into memory (5 seconds)
     sleep(5);
 
-    // Initialize the Gloss Hooking library
     GlossInit(true);
 
-    LOGI("Keystrokes: Initializing Hooks...");
-
-    // 1. Hook EGL swap (This creates our 'Render Loop')
+    // Hook EGL swap
     GHandle hegl = GlossOpen("libEGL.so");
     void* swap   = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
     if (!swap) {
         GHandle hgles = GlossOpen("libGLESv2.so");
         swap = (void*)GlossSymbol(hgles, "eglSwapBuffers", nullptr);
     }
-    
-    if (swap) {
-        GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
-        LOGI("Keystrokes: EGL Hooked Successfully");
-    }
+    if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
 
-    // 2. Hook InputConsumer::consume (For Menu Touch Interaction)
+    // Hook InputConsumer::consume for touch / LMB / RMB / settings UI
     GHandle hlib     = GlossOpen("libinput.so");
     void* symconsume = nullptr;
 
@@ -554,11 +661,15 @@ static void* mainthread(void*) {
         symconsume = (void*)GlossSymbol(hlib, consume_syms[i], nullptr);
         if (symconsume) {
             g_consume_variant = i;
+            LOGI("consume: matched variant %d -> %s", i, consume_syms[i]);
             break;
         }
+        LOGI("consume: variant %d not found", i);
     }
 
-    if (symconsume) {
+    if (!symconsume) {
+        LOGW("consume: no variant matched on this device — touch UI will not work");
+    } else {
         switch (g_consume_variant) {
             case 0: GlossHook(symconsume, (void*)hook_consume_0, (void**)&orig_consume_0); break;
             case 1: GlossHook(symconsume, (void*)hook_consume_1, (void**)&orig_consume_1); break;
@@ -566,13 +677,11 @@ static void* mainthread(void*) {
             case 3: GlossHook(symconsume, (void*)hook_consume_3, (void**)&orig_consume_3); break;
             case 4: GlossHook(symconsume, (void*)hook_consume_4, (void**)&orig_consume_4); break;
         }
-        LOGI("Keystrokes: Input Hooked Successfully (Variant %d)", g_consume_variant);
     }
 
     return nullptr;
 }
 
-// Entry point when the .so is loaded
 __attribute__((constructor))
 void keystrokes_init() {
     pthread_t t;
