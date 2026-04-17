@@ -45,10 +45,11 @@ struct MoveInputComponent {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  2. Key state  +  per-key visibility settings
+//  REMOVED: LMB and RMB - this is mobile, not PC!
 // ─────────────────────────────────────────────────────────────────────────────
 struct KeyState {
     bool w=false, a=false, s=false, d=false;
-    bool space=false, lmb=false, rmb=false;
+    bool space=false;
 };
 
 struct KeySettings {
@@ -57,8 +58,6 @@ struct KeySettings {
     bool show_s     = true;
     bool show_d     = true;
     bool show_space = true;
-    bool show_lmb   = true;
-    bool show_rmb   = true;
 };
 
 static KeyState    g_keys;
@@ -110,61 +109,7 @@ void hook_NormalTick(void* player) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  4. Input hook — LMB / RMB via AInputEvent
-//     Hooks the same libinput.so symbols as ZhyKun's original mod.
-// ─────────────────────────────────────────────────────────────────────────────
-static void       (*orig_input1)(void*, void*, void*)              = nullptr;
-static int32_t    (*orig_input2)(void*, void*, bool, long,
-                                  uint32_t*, AInputEvent**)        = nullptr;
-
-static void handle_mouse_event(AInputEvent* event) {
-    if (!event) return;
-    if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) return;
-
-    int32_t btn = AMotionEvent_getButtonState(event);
-    std::lock_guard<std::mutex> lock(g_keymutex);
-    g_keys.lmb = (btn & AMOTION_EVENT_BUTTON_PRIMARY)   != 0;
-    g_keys.rmb = (btn & AMOTION_EVENT_BUTTON_SECONDARY) != 0;
-}
-
-static void hook_input1(void* thiz, void* a1, void* a2) {
-    if (orig_input1) orig_input1(thiz, a1, a2);
-    if (thiz && g_initialized)
-        handle_mouse_event((AInputEvent*)thiz);
-}
-
-static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3,
-                            uint32_t* a4, AInputEvent** event) {
-    int32_t r = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (r == 0 && event && *event && g_initialized)
-        handle_mouse_event(*event);
-    return r;
-}
-
-static void hook_input() {
-    void* sym1 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE",
-        nullptr);
-    if (sym1) {
-        if (GlossHook(sym1, (void*)hook_input1, (void**)&orig_input1)) {
-            LOGI("Hooked input (sym1) for LMB/RMB");
-            return;
-        }
-    }
-    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE",
-        nullptr);
-    if (sym2) {
-        if (GlossHook(sym2, (void*)hook_input2, (void**)&orig_input2)) {
-            LOGI("Hooked input (sym2) for LMB/RMB");
-            return;
-        }
-    }
-    LOGE("Could not hook input — LMB/RMB will stay dark (Bluetooth mouse only)");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  5. GL state save / restore  (prevents corrupting Minecraft's render state)
+//  4. GL state save / restore  (prevents corrupting Minecraft's render state)
 // ─────────────────────────────────────────────────────────────────────────────
 struct GLState {
     GLint  prog, tex, atex, abuf, ebuf, vao, fbo, vp[4], sc[4], bsrc, bdst;
@@ -207,7 +152,7 @@ static void gl_restore(const GLState& s) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  6. UI — drawkey  (white bg + black text when pressed, like ZhyKun's original)
+//  5. UI — drawkey  (white bg + black text when pressed, like ZhyKun's original)
 // ─────────────────────────────────────────────────────────────────────────────
 static void drawkey(const char* lbl, bool pressed, ImVec2 size = ImVec2(60, 60)) {
     ImVec4 bg   = pressed ? ImVec4(1.0f, 1.0f, 1.0f, 0.95f)
@@ -223,7 +168,7 @@ static void drawkey(const char* lbl, bool pressed, ImVec2 size = ImVec2(60, 60))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  7. Settings window  (separate ImGui window, opened via gear button on HUD)
+//  6. Settings window  (separate ImGui window, opened via gear button on HUD)
 // ─────────────────────────────────────────────────────────────────────────────
 static void draw_settings() {
     if (!g_show_settings) return;
@@ -243,22 +188,20 @@ static void draw_settings() {
         ImGui::Checkbox("D  (Right)",    &g_settings.show_d);
         ImGui::Spacing();
         ImGui::Checkbox("SPACE (Jump)",  &g_settings.show_space);
-        ImGui::Spacing();
-        ImGui::Checkbox("LMB  (Attack)", &g_settings.show_lmb);
-        ImGui::Checkbox("RMB  (Use)",    &g_settings.show_rmb);
     }
     ImGui::End();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  8. HUD window
+//  7. HUD window - FIXED STRUCTURE
+//  Layout: W on top, A S D in middle, SPACE at bottom (below WASD)
 // ─────────────────────────────────────────────────────────────────────────────
 static void render_hud() {
     KeyState k;
     { std::lock_guard<std::mutex> lk(g_keymutex); k = g_keys; }
 
-    const float ks = 60.0f;
-    const float sp =  5.0f;
+    const float ks = 60.0f;  // key size
+    const float sp =  5.0f;  // spacing
 
     ImGui::SetNextWindowPos(ImVec2(10, 90), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.0f);
@@ -271,16 +214,19 @@ static void render_hud() {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(sp, sp));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
 
-    // Drag handle
-    ImGui::InvisibleButton("##drag", ImVec2(ks * 3 + sp * 2, 8));
+    // Calculate total width for centering
+    float total_width = ks * 3 + sp * 2;
+
+    // Drag handle (full width)
+    ImGui::InvisibleButton("##drag", ImVec2(total_width, 8));
     if (ImGui::IsItemActive()) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
         ImVec2 p = ImGui::GetWindowPos();
         ImGui::SetWindowPos(ImVec2(p.x + d.x, p.y + d.y));
     }
 
-    // Gear / settings toggle (top-right)
-    ImGui::SameLine(ks * 3 + sp * 2 - 26);
+    // Gear / settings toggle (top-right of drag handle)
+    ImGui::SameLine(total_width - 26);
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.12f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.22f));
@@ -288,43 +234,39 @@ static void render_hud() {
     if (ImGui::Button("##gear", ImVec2(24, 24))) g_show_settings = !g_show_settings;
     ImGui::PopStyleColor(4);
 
-    // ── Row 1: W ──────────────────────────────────────────────────────────
+    // ── Row 1: W (centered) ───────────────────────────────────────────────
     if (g_settings.show_w) {
-        ImGui::SetCursorPosX(ks + sp + 5);
+        // Center W above the ASD row
+        float w_pos_x = (total_width - ks) / 2.0f;
+        ImGui::SetCursorPosX(w_pos_x);
         drawkey("W", k.w, ImVec2(ks, ks));
     }
 
     // ── Row 2: A S D ──────────────────────────────────────────────────────
     bool any_asd = g_settings.show_a || g_settings.show_s || g_settings.show_d;
     if (any_asd) {
-        bool first = true;
-        auto nextkey = [&](const char* lbl, bool pressed, bool show) {
-            if (!show) return;
-            if (!first) ImGui::SameLine();
-            drawkey(lbl, pressed, ImVec2(ks, ks));
-            first = false;
-        };
-        nextkey("A", k.a, g_settings.show_a);
-        nextkey("S", k.s, g_settings.show_s);
-        nextkey("D", k.d, g_settings.show_d);
+        // A (left)
+        if (g_settings.show_a) {
+            drawkey("A", k.a, ImVec2(ks, ks));
+        }
+        
+        // S (center) - use SameLine if A was drawn
+        if (g_settings.show_s) {
+            if (g_settings.show_a) ImGui::SameLine();
+            drawkey("S", k.s, ImVec2(ks, ks));
+        }
+        
+        // D (right) - use SameLine if S or A was drawn
+        if (g_settings.show_d) {
+            if (g_settings.show_a || g_settings.show_s) ImGui::SameLine();
+            drawkey("D", k.d, ImVec2(ks, ks));
+        }
     }
 
-    // ── Row 3: SPACE ──────────────────────────────────────────────────────
+    // ── Row 3: SPACE (below WASD, full width) ─────────────────────────────
     if (g_settings.show_space) {
-        drawkey("SPACE", k.space, ImVec2(ks * 3 + sp * 2, 40));
-    }
-
-    // ── Row 4: LMB  RMB ───────────────────────────────────────────────────
-    bool any_mouse = g_settings.show_lmb || g_settings.show_rmb;
-    if (any_mouse) {
-        float half = (ks * 3 + sp * 2 - sp) / 2.0f;
-        if (g_settings.show_lmb) {
-            drawkey("LMB", k.lmb, ImVec2(half, ks));
-            if (g_settings.show_rmb) ImGui::SameLine();
-        }
-        if (g_settings.show_rmb) {
-            drawkey("RMB", k.rmb, ImVec2(half, ks));
-        }
+        // SPACE spans full width below ASD
+        drawkey("SPACE", k.space, ImVec2(total_width, 40));
     }
 
     ImGui::PopStyleVar(2);
@@ -332,7 +274,7 @@ static void render_hud() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  9. EGL swap hook
+//  8. EGL swap hook
 // ─────────────────────────────────────────────────────────────────────────────
 static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
@@ -387,7 +329,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  10. Entry point
+//  9. Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 void* main_thread(void*) {
     sleep(15);
@@ -404,9 +346,6 @@ void* main_thread(void*) {
         void* tick = (void*)GlossSymbol(hmc, "_ZN11LocalPlayer10normalTickEv", nullptr);
         if (tick) GlossHook(tick, (void*)hook_NormalTick, (void**)&orig_NormalTick);
     }
-
-    // Input hook (LMB + RMB via Bluetooth mouse / USB OTG)
-    hook_input();
 
     return nullptr;
 }
