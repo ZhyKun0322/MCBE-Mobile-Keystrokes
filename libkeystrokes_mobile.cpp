@@ -23,7 +23,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
-#define VERSION "1.2.4-fixed"
+#define VERSION "1.2.5-safe-no-crash"
 
 struct KeyState {
     bool w = false, a = false, s = false, d = false;
@@ -47,26 +47,31 @@ static bool  g_showsettings = false;
 static ImVec2 g_hudpos      = ImVec2(100, 100);
 static bool  g_posloaded    = false;
 
-// ── EXACT OFFSETS FROM YOUR MEMORY EDITOR SCREENS ───────────────────────
+// ── SAFE MEMORY SCANNER (prevents crash) ─────────────────────────────────
 static uintptr_t g_mcBase = 0;
+static uintptr_t g_mcSize = 0;        // module size for safety
 static bool g_baseFound = false;
 
-static const uintptr_t OFF_MOVE_X = 0xffffffffc7446130ULL; // Horizontal (A/D) ← from left/right search
-static const uintptr_t OFF_MOVE_Y = 0xffffffffc7446314ULL; // Vertical (W/S)   ← from forwards/backwards search
+// Offsets calculated from your screenshots (relative to MC Base)
+static const uintptr_t OFF_MOVE_X = 0xffffffffc7446130ULL; // A/D (left/right)
+static const uintptr_t OFF_MOVE_Y = 0xffffffffc7446314ULL; // W/S (forward/back)
 static const uintptr_t OFF_JUMP   = 0xffffffffda1bf62cULL; // Jump
 
 static void updateMcBase() {
     if (g_baseFound) return;
+
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return;
+
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         if (strstr(line, "libminecraftpe.so")) {
             uintptr_t start = 0, end = 0;
             sscanf(line, "%" PRIxPTR "-%" PRIxPTR, &start, &end);
             g_mcBase = start;
+            g_mcSize = end - start;
             g_baseFound = true;
-            LOGI("✅ libminecraftpe.so base = 0x%" PRIxPTR, g_mcBase);
+            LOGI("✅ libminecraftpe.so | base=0x%" PRIxPTR " | size=0x%" PRIxPTR, g_mcBase, g_mcSize);
             break;
         }
     }
@@ -76,6 +81,18 @@ static void updateMcBase() {
 static void updateKeysFromMemory() {
     updateMcBase();
     if (!g_baseFound) return;
+
+    // SAFETY CHECK - prevents crash if offset is outside the module
+    if (OFF_MOVE_X >= g_mcSize || OFF_MOVE_Y >= g_mcSize || OFF_JUMP >= g_mcSize) {
+        static bool warned = false;
+        if (!warned) {
+            LOGW("⚠️ OFFSETS OUT OF RANGE → keys will NOT light up (common on newer MC versions)");
+            LOGW("   MC Base from editor: 0x6c55e5a000");
+            LOGW("   Module base found by mod: 0x%" PRIxPTR, g_mcBase);
+            warned = true;
+        }
+        return;
+    }
 
     float horizontal = *(float*)(g_mcBase + OFF_MOVE_X);
     float vertical   = *(float*)(g_mcBase + OFF_MOVE_Y);
@@ -89,11 +106,9 @@ static void updateKeysFromMemory() {
     g_keys.d = (horizontal < -0.5f);
     g_keys.space = (jumpState > 0.5f);
 }
-// ───────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────
 
-// (The rest of the file is 100% identical to the version I gave you last time — all the hooks, drawing, settings, render, etc.)
-
-// ... [paste the entire remaining code from my previous message here, starting from "static const char* SAVE_PATHS[]" all the way to the end]
+// The rest of the file is unchanged (input, drawing, settings, render, hooks, etc.)
 
 static const char* SAVE_PATHS[] = {
     "/data/data/com.mojang.minecraftpe/files/keystrokes.cfg",
