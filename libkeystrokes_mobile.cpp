@@ -31,7 +31,7 @@ struct MoveInputComponent {
     MoveInputState  mRawInputState;         // [0x10]
     uint8_t         mHoldAutoJumpInWaterTicks; // [0x20]
     char            pad[0x3];
-    Vec2            mMove;                 // [0x24]
+    Vec2            mMove;                 // [0x24] - KEY FOR MOVEMENT
     Vec2            mLookDelta;            // [0x2C]
     Vec2            mInteractDir;          // [0x34]
     char            pad2[0x4];
@@ -48,6 +48,7 @@ struct MoveInputComponent {
 struct KeyState {
     bool w=false, a=false, s=false, d=false;
     bool space=false;
+    // REMOVED: lmb and rmb - not needed for mobile touch controls
 };
 
 struct KeySettings {
@@ -56,6 +57,7 @@ struct KeySettings {
     bool show_s     = true;
     bool show_d     = true;
     bool show_space = true;
+    // REMOVED: show_lmb and show_rmb
 };
 
 static KeyState    g_keys;
@@ -63,10 +65,11 @@ static KeySettings g_settings;
 static std::mutex  g_keymutex;
 static bool        g_initialized   = false;
 static bool        g_show_settings = false;
-static bool        g_hook_working  = false; // Track if hook is working
+static bool        g_hook_working  = false;
+static int         g_micOffset     = 0; // Will auto-detect
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  3. NormalTick hook — FIXED with better error checking
+//  3. NormalTick hook — WASD + SPACE only
 // ─────────────────────────────────────────────────────────────────────────────
 typedef void (*NormalTick_t)(void*);
 static NormalTick_t orig_NormalTick = nullptr;
@@ -81,54 +84,63 @@ void hook_NormalTick(void* player) {
     
     if (!player) return;
     
-    // Try multiple offsets to find MoveInputComponent
-    // Offset 0x10A8 might vary by version, so we try a range
-    MoveInputComponent* mic = nullptr;
-    
-    // Common offsets for LocalPlayer -> MoveInputComponent
-    const uintptr_t offsets[] = { 0x10A8, 0x10B0, 0x10C0, 0x1100, 0x1150, 0xF00, 0xF80 };
-    uintptr_t playerAddr = (uintptr_t)player;
-    
-    for (size_t i = 0; i < sizeof(offsets)/sizeof(offsets[0]); i++) {
-        void** ptr = (void**)(playerAddr + offsets[i]);
-        if (!ptr || !*ptr) continue;
+    // Auto-detect offset on first call
+    if (g_micOffset == 0) {
+        // Extended offset list for 26.13.1
+        const int offsets[] = { 
+            0x10A8, 0x10B0, 0x10B8, 0x10C0, 0x10C8, 0x10D0, 0x10D8, 0x10E0,
+            0x10E8, 0x10F0, 0x10F8, 0x1100, 0x1108, 0x1110, 0x1118, 0x1120,
+            0xF00, 0xF08, 0xF10, 0xF18, 0xF20, 0xF28, 0xF30, 0xF38,
+            0xF80, 0xF88, 0xF90, 0xF98, 0xFA0, 0xFA8, 0xFB0, 0xFB8,
+            0xFC0, 0xFC8, 0xFD0, 0xFD8, 0xFE0, 0xFE8, 0xFF0, 0xFF8,
+            0x1000, 0x1008, 0x1010, 0x1018, 0x1020, 0x1028, 0x1030, 0x1038,
+            0x1040, 0x1048, 0x1050, 0x1058, 0x1060, 0x1068, 0x1070, 0x1078,
+            0x1080, 0x1088, 0x1090, 0x1098, 0x10A0
+        };
         
-        // Validate: check if mMove values are reasonable (-10 to 10 range)
-        Vec2* mMove = (Vec2*)((uintptr_t)*ptr + 0x24);
-        if (mMove->x >= -10.0f && mMove->x <= 10.0f && 
-            mMove->y >= -10.0f && mMove->y <= 10.0f) {
-            mic = (MoveInputComponent*)*ptr;
-            if (g_tick_count % 120 == 0) {
-                LOGI("Found MoveInputComponent at offset 0x%zX", offsets[i]);
+        uintptr_t playerAddr = (uintptr_t)player;
+        
+        for (size_t i = 0; i < sizeof(offsets)/sizeof(offsets[0]); i++) {
+            void** ptr = (void**)(playerAddr + offsets[i]);
+            if (!ptr || !*ptr) continue;
+            
+            // Validate: check if mMove values are reasonable
+            Vec2* mMove = (Vec2*)((uintptr_t)*ptr + 0x24);
+            if (mMove->x >= -100.0f && mMove->x <= 100.0f && 
+                mMove->y >= -100.0f && mMove->y <= 100.0f) {
+                g_micOffset = offsets[i];
+                g_hook_working = true;
+                LOGI("TACOS: Found MIC at player+0x%X", g_micOffset);
+                break;
             }
-            break;
         }
+        
+        if (g_micOffset == 0) return; // Not found yet
     }
     
-    if (!mic) {
-        // Component not found, don't spam logs
-        return;
-    }
-    
-    g_hook_working = true;
-    
-    std::lock_guard<std::mutex> lock(g_keymutex);
-    
-    // Read movement from mMove [0x24]
-    // Note: In MC, negative Y is forward (W), positive Y is backward (S)
-    g_keys.w     = (mic->mMove.y < -0.15f);
-    g_keys.s     = (mic->mMove.y >  0.15f);
-    g_keys.a     = (mic->mMove.x < -0.15f);
-    g_keys.d     = (mic->mMove.x >  0.15f);
-    
-    // Read jump from mFlagValues [0x60] bit 0
-    g_keys.space = (mic->mFlagValues & 0x1) != 0;
-    
-    // Debug log every 120 ticks (2 seconds at 60fps)
-    if (++g_tick_count % 120 == 0) {
-        LOGI("mMove=(%.2f,%.2f) flags=0x%04X W=%d A=%d S=%d D=%d SPACE=%d",
-             mic->mMove.x, mic->mMove.y, mic->mFlagValues,
-             g_keys.w, g_keys.a, g_keys.s, g_keys.d, g_keys.space);
+    // Use found offset
+    void** micPtr = (void**)((uintptr_t)player + g_micOffset);
+    if (micPtr && *micPtr) {
+        MoveInputComponent* mic = (MoveInputComponent*)*micPtr;
+        
+        std::lock_guard<std::mutex> lock(g_keymutex);
+        
+        // Read movement from mMove [0x24]
+        // Note: In MC, negative Y is forward (W), positive Y is backward (S)
+        g_keys.w     = (mic->mMove.y < -0.15f);
+        g_keys.s     = (mic->mMove.y >  0.15f);
+        g_keys.a     = (mic->mMove.x < -0.15f);
+        g_keys.d     = (mic->mMove.x >  0.15f);
+        
+        // Read jump from mFlagValues [0x60] bit 0
+        g_keys.space = (mic->mFlagValues & 0x1) != 0;
+        
+        // Debug log every 60 ticks
+        if (++g_tick_count % 60 == 0) {
+            LOGI("TACOS: off=0x%X mMove=(%.2f,%.2f) W=%d A=%d S=%d D=%d JMP=%d",
+                 g_micOffset, mic->mMove.x, mic->mMove.y,
+                 g_keys.w, g_keys.a, g_keys.s, g_keys.d, g_keys.space);
+        }
     }
 }
 
@@ -192,13 +204,13 @@ static void drawkey(const char* lbl, bool pressed, ImVec2 size = ImVec2(60, 60))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  6. Settings window
+//  6. Settings window (NO LMB/RMB options)
 // ─────────────────────────────────────────────────────────────────────────────
 static void draw_settings() {
     if (!g_show_settings) return;
 
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(220, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(240, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.85f);
 
     if (ImGui::Begin("Keystroke Settings", &g_show_settings,
@@ -212,11 +224,15 @@ static void draw_settings() {
         ImGui::Checkbox("D  (Right)",    &g_settings.show_d);
         ImGui::Spacing();
         ImGui::Checkbox("SPACE (Jump)",  &g_settings.show_space);
+        // REMOVED: LMB and RMB checkboxes
         
-        // Show hook status
+        // Debug info
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::TextDisabled("Hook: %s", g_hook_working ? "WORKING" : "SEARCHING...");
+        ImGui::TextDisabled("DEBUG:");
+        ImGui::Text("Hook: %s", g_hook_working ? "WORKING" : "SEARCHING...");
+        ImGui::Text("Offset: 0x%X", g_micOffset);
+        ImGui::Text("Ticks: %d", g_tick_count);
     }
     ImGui::End();
 }
@@ -347,16 +363,8 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  9. Entry point - FIXED symbol name and added pattern scan fallback
+//  9. Entry point - REMOVED input hooks (not needed for mobile)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Pattern for LocalPlayer::normalTick (common in MCBE 1.20+)
-// This is a fallback if symbol lookup fails
-static bool pattern_match(uintptr_t addr, const char* pattern, const char* mask) {
-    // Simple pattern scan implementation
-    return false; // Placeholder - implement if needed
-}
-
 void* main_thread(void*) {
     sleep(15);
     GlossInit(true);
@@ -369,43 +377,35 @@ void* main_thread(void*) {
         LOGI("EGL hook installed");
     }
 
-    // NormalTick hook - FIXED: try multiple symbol names
+    // NormalTick hook - try multiple symbol names for 26.13.1
     GHandle hmc = GlossOpen("libminecraftpe.so");
     if (hmc) {
         void* tick = nullptr;
         
-        // Try different mangled names for LocalPlayer::normalTick
+        // Try different mangled names
         const char* symbols[] = {
-            "_ZN11LocalPlayer10normalTickEv",     // Standard Itanium mangling
-            "_ZN11LocalPlayer10NormalTickEv",     // Capital N (wrong but try anyway)
-            "normalTick",                          // Unmangled (if exported)
-            "_ZN11LocalPlayer4tickEv",            // Alternative name
+            "_ZN11LocalPlayer10normalTickEv",     // lowercase (most likely)
+            "_ZN11LocalPlayer10NormalTickEv",     // capital N
+            "_ZN11LocalPlayer4tickEv",            // short name
             nullptr
         };
         
         for (int i = 0; symbols[i]; i++) {
             tick = (void*)GlossSymbol(hmc, symbols[i], nullptr);
             if (tick) {
-                LOGI("Found normalTick at symbol: %s", symbols[i]);
+                LOGI("Found symbol: %s", symbols[i]);
                 break;
             }
         }
         
-        // If symbol not found, try to find via string reference
-        if (!tick) {
-            LOGI("Symbol not found, trying string search...");
-            // Look for "normalTick" string in binary, then find xref to function
-            // This requires more advanced scanning
-        }
-        
         if (tick) {
             if (GlossHook(tick, (void*)hook_NormalTick, (void**)&orig_NormalTick)) {
-                LOGI("NormalTick hook installed successfully!");
+                LOGI("NormalTick hook installed!");
             } else {
                 LOGE("Failed to hook NormalTick");
             }
         } else {
-            LOGE("Could not find LocalPlayer::normalTick - keystrokes won't work!");
+            LOGE("Could not find LocalPlayer::normalTick - symbols stripped in 26.13.1");
         }
     } else {
         LOGE("Could not open libminecraftpe.so");
