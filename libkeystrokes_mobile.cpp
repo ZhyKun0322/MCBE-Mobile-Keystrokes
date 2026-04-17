@@ -11,82 +11,36 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
 
-#define LOG_TAG "MobileKeystrokes"
-
-// --- TACO'S STRUCT ---
-struct Vec2 { float x, y; };
-struct MoveInputComponent {
-    char filler0[0x24];
-    Vec2 mMove;
-};
-
-struct KeyState { bool w=0, a=0, s=0, d=0; };
-static KeyState g_keys;
-static std::mutex g_keymutex;
+static uintptr_t g_playerAddr = 0; 
 static bool g_initialized = false;
-static uintptr_t g_playerAddr = 0; // For debugging
 
-// --- THE BRAIN (With Safety Shield) ---
 typedef void (*NormalTick)(void* self);
 static NormalTick orig_NormalTick = nullptr;
 
+// This only saves the Player address, it DOES NOT look for movement
+// This makes it impossible to crash.
 void hook_NormalTick(void* player) {
     if (player) {
-        g_playerAddr = (uintptr_t)player; // Save address to show on screen
-
-        // SAFETY SHIELD: We check if the memory address is valid before reading
-        // Offset 0x10A8 is our guess. We will check it carefully.
-        uintptr_t mic_ptr_addr = (uintptr_t)player + 0x10A8; 
-        
-        // Basic pointer validation (must be in a high memory range)
-        if (mic_ptr_addr > 0x1000000) { 
-            MoveInputComponent** mic_pp = (MoveInputComponent**)mic_ptr_addr;
-            
-            if (mic_pp && *mic_pp) {
-                MoveInputComponent* mic = *mic_pp;
-                
-                // Final safety check before reading X/Y
-                if ((uintptr_t)mic > 0x1000000) {
-                    std::lock_guard<std::mutex> lock(g_keymutex);
-                    g_keys.a = (mic->mMove.x < -0.1f);
-                    g_keys.d = (mic->mMove.x > 0.1f);
-                    g_keys.w = (mic->mMove.y > 0.1f);
-                    g_keys.s = (mic->mMove.y < -0.1f);
-                }
-            }
-        }
+        g_playerAddr = (uintptr_t)player; 
     }
     if (orig_NormalTick) orig_NormalTick(player);
 }
 
-// --- DEBUG UI ---
 void render_hud() {
     ImGui::SetNextWindowPos(ImVec2(100, 100), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(250, 200), ImGuiCond_Always);
-    ImGui::Begin("##HUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground);
+    ImGui::SetNextWindowSize(ImVec2(300, 100), ImGuiCond_Always);
+    ImGui::Begin("DEBUG HUD", nullptr, ImGuiWindowFlags_NoDecoration);
     
-    // Debug Info: Shows your Player Address on screen
-    ImGui::Text("Player: 0x%lX", g_playerAddr);
-
-    float ks = 60.0f;
-    ImGui::SetCursorPosX(75);
-    auto drawkey = [](const char* lbl, bool act, float size) {
-        ImVec4 col = act ? ImVec4(1,1,1,0.8f) : ImVec4(0,0,0,0.4f);
-        ImGui::PushStyleColor(ImGuiCol_Button, col);
-        ImGui::Button(lbl, ImVec2(size, size));
-        ImGui::PopStyleColor();
-    };
-
-    drawkey("W", g_keys.w, ks);
-    ImGui::SetCursorPosX(10);
-    drawkey("A", g_keys.a, ks); ImGui::SameLine();
-    drawkey("S", g_keys.s, ks); ImGui::SameLine();
-    drawkey("D", g_keys.d, ks);
+    if (g_playerAddr == 0) {
+        ImGui::Text("Waiting for player...");
+    } else {
+        ImGui::Text("Player Address: 0x%lX", g_playerAddr);
+        ImGui::Text("W A S D logic is OFF for now.");
+    }
     
     ImGui::End();
 }
 
-// --- STANDARD HOOKS ---
 static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     EGLint w, h;
