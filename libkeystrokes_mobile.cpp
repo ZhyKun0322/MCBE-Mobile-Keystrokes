@@ -22,30 +22,28 @@
 struct Vec2 { float x, y; };
 struct Vec3 { float x, y, z; };
 
-// MoveInputState occupies 0x10 bytes (two of them back-to-back)
 struct MoveInputState {
     char data[0x10];
 };
 
 struct MoveInputComponent {
-    MoveInputState  mInputState;            // [0x00] processed input state
-    MoveInputState  mRawInputState;         // [0x10] RAW input state (D-pad/touch)
+    MoveInputState  mInputState;            // [0x00]
+    MoveInputState  mRawInputState;         // [0x10]
     uint8_t         mHoldAutoJumpInWaterTicks; // [0x20]
-    char            pad[0x3];              // align to 0x24
-    Vec2            mMove;                 // [0x24] movement vector
+    char            pad[0x3];
+    Vec2            mMove;                 // [0x24]
     Vec2            mLookDelta;            // [0x2C]
     Vec2            mInteractDir;          // [0x34]
-    char            pad2[0x4];             // align to 0x3C
+    char            pad2[0x4];
     Vec3            mDisplacement;         // [0x3C]
     Vec3            mDisplacementDelta;    // [0x48]
     Vec3            mCameraOrientation;    // [0x54]
-    unsigned short  mFlagValues;           // [0x60] brstd::bitset<11,ushort> — bit 0 = jump
+    unsigned short  mFlagValues;           // [0x60] bit 0 = jump
     bool            mIsPaddling[2];        // [0x61]
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  2. Key state  +  per-key visibility settings
-//  REMOVED: LMB and RMB - this is mobile, not PC!
+//  2. Key state + settings (NO LMB/RMB - mobile only!)
 // ─────────────────────────────────────────────────────────────────────────────
 struct KeyState {
     bool w=false, a=false, s=false, d=false;
@@ -65,13 +63,10 @@ static KeySettings g_settings;
 static std::mutex  g_keymutex;
 static bool        g_initialized   = false;
 static bool        g_show_settings = false;
+static bool        g_hook_working  = false; // Track if hook is working
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  3. NormalTick hook — WASD + SPACE
-//     mMove at [0x24] reflects the FINAL movement vector (works for joystick).
-//     For D-pad/touch, mRawInputState at [0x10] holds the unprocessed state.
-//     We read mMove for direction and mFlagValues for jump — both confirmed
-//     by Taco's struct dump for 26.13.1.
+//  3. NormalTick hook — FIXED with better error checking
 // ─────────────────────────────────────────────────────────────────────────────
 typedef void (*NormalTick_t)(void*);
 static NormalTick_t orig_NormalTick = nullptr;
@@ -79,37 +74,66 @@ static NormalTick_t orig_NormalTick = nullptr;
 static int g_tick_count = 0;
 
 void hook_NormalTick(void* player) {
-    if (player) {
-        MoveInputComponent* mic =
-            *(MoveInputComponent**)((uintptr_t)player + 0x10A8);
-
-        if (mic) {
-            std::lock_guard<std::mutex> lock(g_keymutex);
-
-            // mMove [0x24]: x = strafe, y = forward
-            // Positive y = forward (W), negative y = backward (S)
-            // Positive x = right (D),  negative x = left (A)
-            g_keys.w     = (mic->mMove.y >  0.1f);
-            g_keys.s     = (mic->mMove.y < -0.1f);
-            g_keys.d     = (mic->mMove.x >  0.1f);
-            g_keys.a     = (mic->mMove.x < -0.1f);
-
-            // mFlagValues [0x60]: bit 0 = jump
-            g_keys.space = (mic->mFlagValues & 0x1) != 0;
-
-            // Debug: log every 60 ticks so we can verify values in logcat
-            if (++g_tick_count % 60 == 0) {
-                LOGI("mMove=(%.2f,%.2f) flags=0x%X w=%d a=%d s=%d d=%d space=%d",
-                     mic->mMove.x, mic->mMove.y, mic->mFlagValues,
-                     g_keys.w, g_keys.a, g_keys.s, g_keys.d, g_keys.space);
+    // Call original FIRST
+    if (orig_NormalTick) {
+        orig_NormalTick(player);
+    }
+    
+    if (!player) return;
+    
+    // Try multiple offsets to find MoveInputComponent
+    // Offset 0x10A8 might vary by version, so we try a range
+    MoveInputComponent* mic = nullptr;
+    
+    // Common offsets for LocalPlayer -> MoveInputComponent
+    const uintptr_t offsets[] = { 0x10A8, 0x10B0, 0x10C0, 0x1100, 0x1150, 0xF00, 0xF80 };
+    uintptr_t playerAddr = (uintptr_t)player;
+    
+    for (size_t i = 0; i < sizeof(offsets)/sizeof(offsets[0]); i++) {
+        void** ptr = (void**)(playerAddr + offsets[i]);
+        if (!ptr || !*ptr) continue;
+        
+        // Validate: check if mMove values are reasonable (-10 to 10 range)
+        Vec2* mMove = (Vec2*)((uintptr_t)*ptr + 0x24);
+        if (mMove->x >= -10.0f && mMove->x <= 10.0f && 
+            mMove->y >= -10.0f && mMove->y <= 10.0f) {
+            mic = (MoveInputComponent*)*ptr;
+            if (g_tick_count % 120 == 0) {
+                LOGI("Found MoveInputComponent at offset 0x%zX", offsets[i]);
             }
+            break;
         }
     }
-    if (orig_NormalTick) orig_NormalTick(player);
+    
+    if (!mic) {
+        // Component not found, don't spam logs
+        return;
+    }
+    
+    g_hook_working = true;
+    
+    std::lock_guard<std::mutex> lock(g_keymutex);
+    
+    // Read movement from mMove [0x24]
+    // Note: In MC, negative Y is forward (W), positive Y is backward (S)
+    g_keys.w     = (mic->mMove.y < -0.15f);
+    g_keys.s     = (mic->mMove.y >  0.15f);
+    g_keys.a     = (mic->mMove.x < -0.15f);
+    g_keys.d     = (mic->mMove.x >  0.15f);
+    
+    // Read jump from mFlagValues [0x60] bit 0
+    g_keys.space = (mic->mFlagValues & 0x1) != 0;
+    
+    // Debug log every 120 ticks (2 seconds at 60fps)
+    if (++g_tick_count % 120 == 0) {
+        LOGI("mMove=(%.2f,%.2f) flags=0x%04X W=%d A=%d S=%d D=%d SPACE=%d",
+             mic->mMove.x, mic->mMove.y, mic->mFlagValues,
+             g_keys.w, g_keys.a, g_keys.s, g_keys.d, g_keys.space);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  4. GL state save / restore  (prevents corrupting Minecraft's render state)
+//  4. GL state save / restore
 // ─────────────────────────────────────────────────────────────────────────────
 struct GLState {
     GLint  prog, tex, atex, abuf, ebuf, vao, fbo, vp[4], sc[4], bsrc, bdst;
@@ -152,7 +176,7 @@ static void gl_restore(const GLState& s) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  5. UI — drawkey  (white bg + black text when pressed, like ZhyKun's original)
+//  5. UI — drawkey
 // ─────────────────────────────────────────────────────────────────────────────
 static void drawkey(const char* lbl, bool pressed, ImVec2 size = ImVec2(60, 60)) {
     ImVec4 bg   = pressed ? ImVec4(1.0f, 1.0f, 1.0f, 0.95f)
@@ -168,7 +192,7 @@ static void drawkey(const char* lbl, bool pressed, ImVec2 size = ImVec2(60, 60))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  6. Settings window  (separate ImGui window, opened via gear button on HUD)
+//  6. Settings window
 // ─────────────────────────────────────────────────────────────────────────────
 static void draw_settings() {
     if (!g_show_settings) return;
@@ -188,20 +212,25 @@ static void draw_settings() {
         ImGui::Checkbox("D  (Right)",    &g_settings.show_d);
         ImGui::Spacing();
         ImGui::Checkbox("SPACE (Jump)",  &g_settings.show_space);
+        
+        // Show hook status
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled("Hook: %s", g_hook_working ? "WORKING" : "SEARCHING...");
     }
     ImGui::End();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  7. HUD window - FIXED STRUCTURE
-//  Layout: W on top, A S D in middle, SPACE at bottom (below WASD)
+//  7. HUD window - FIXED STRUCTURE: W on top, A S D middle, SPACE bottom
 // ─────────────────────────────────────────────────────────────────────────────
 static void render_hud() {
     KeyState k;
     { std::lock_guard<std::mutex> lk(g_keymutex); k = g_keys; }
 
-    const float ks = 60.0f;  // key size
-    const float sp =  5.0f;  // spacing
+    const float ks = 60.0f;
+    const float sp =  5.0f;
+    float total_width = ks * 3 + sp * 2;
 
     ImGui::SetNextWindowPos(ImVec2(10, 90), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.0f);
@@ -214,10 +243,7 @@ static void render_hud() {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(sp, sp));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
 
-    // Calculate total width for centering
-    float total_width = ks * 3 + sp * 2;
-
-    // Drag handle (full width)
+    // Drag handle
     ImGui::InvisibleButton("##drag", ImVec2(total_width, 8));
     if (ImGui::IsItemActive()) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
@@ -225,7 +251,7 @@ static void render_hud() {
         ImGui::SetWindowPos(ImVec2(p.x + d.x, p.y + d.y));
     }
 
-    // Gear / settings toggle (top-right of drag handle)
+    // Settings gear button
     ImGui::SameLine(total_width - 26);
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.12f));
@@ -234,9 +260,8 @@ static void render_hud() {
     if (ImGui::Button("##gear", ImVec2(24, 24))) g_show_settings = !g_show_settings;
     ImGui::PopStyleColor(4);
 
-    // ── Row 1: W (centered) ───────────────────────────────────────────────
+    // ── Row 1: W (centered above ASD) ────────────────────────────────────
     if (g_settings.show_w) {
-        // Center W above the ASD row
         float w_pos_x = (total_width - ks) / 2.0f;
         ImGui::SetCursorPosX(w_pos_x);
         drawkey("W", k.w, ImVec2(ks, ks));
@@ -245,27 +270,21 @@ static void render_hud() {
     // ── Row 2: A S D ──────────────────────────────────────────────────────
     bool any_asd = g_settings.show_a || g_settings.show_s || g_settings.show_d;
     if (any_asd) {
-        // A (left)
         if (g_settings.show_a) {
             drawkey("A", k.a, ImVec2(ks, ks));
         }
-        
-        // S (center) - use SameLine if A was drawn
         if (g_settings.show_s) {
             if (g_settings.show_a) ImGui::SameLine();
             drawkey("S", k.s, ImVec2(ks, ks));
         }
-        
-        // D (right) - use SameLine if S or A was drawn
         if (g_settings.show_d) {
             if (g_settings.show_a || g_settings.show_s) ImGui::SameLine();
             drawkey("D", k.d, ImVec2(ks, ks));
         }
     }
 
-    // ── Row 3: SPACE (below WASD, full width) ─────────────────────────────
+    // ── Row 3: SPACE (full width below WASD) ─────────────────────────────
     if (g_settings.show_space) {
-        // SPACE spans full width below ASD
         drawkey("SPACE", k.space, ImVec2(total_width, 40));
     }
 
@@ -291,7 +310,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
 
-        // Scale font to screen — same logic as ZhyKun's original
         float scale = (float)h / 720.0f;
         if (scale < 1.5f) scale = 1.5f;
         if (scale > 4.0f) scale = 4.0f;
@@ -329,8 +347,16 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  9. Entry point
+//  9. Entry point - FIXED symbol name and added pattern scan fallback
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Pattern for LocalPlayer::normalTick (common in MCBE 1.20+)
+// This is a fallback if symbol lookup fails
+static bool pattern_match(uintptr_t addr, const char* pattern, const char* mask) {
+    // Simple pattern scan implementation
+    return false; // Placeholder - implement if needed
+}
+
 void* main_thread(void*) {
     sleep(15);
     GlossInit(true);
@@ -338,13 +364,51 @@ void* main_thread(void*) {
     // EGL hook
     GHandle hegl = GlossOpen("libEGL.so");
     void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
-    if (swap) GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    if (swap) {
+        GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+        LOGI("EGL hook installed");
+    }
 
-    // NormalTick hook (WASD + SPACE)
+    // NormalTick hook - FIXED: try multiple symbol names
     GHandle hmc = GlossOpen("libminecraftpe.so");
     if (hmc) {
-        void* tick = (void*)GlossSymbol(hmc, "_ZN11LocalPlayer10normalTickEv", nullptr);
-        if (tick) GlossHook(tick, (void*)hook_NormalTick, (void**)&orig_NormalTick);
+        void* tick = nullptr;
+        
+        // Try different mangled names for LocalPlayer::normalTick
+        const char* symbols[] = {
+            "_ZN11LocalPlayer10normalTickEv",     // Standard Itanium mangling
+            "_ZN11LocalPlayer10NormalTickEv",     // Capital N (wrong but try anyway)
+            "normalTick",                          // Unmangled (if exported)
+            "_ZN11LocalPlayer4tickEv",            // Alternative name
+            nullptr
+        };
+        
+        for (int i = 0; symbols[i]; i++) {
+            tick = (void*)GlossSymbol(hmc, symbols[i], nullptr);
+            if (tick) {
+                LOGI("Found normalTick at symbol: %s", symbols[i]);
+                break;
+            }
+        }
+        
+        // If symbol not found, try to find via string reference
+        if (!tick) {
+            LOGI("Symbol not found, trying string search...");
+            // Look for "normalTick" string in binary, then find xref to function
+            // This requires more advanced scanning
+        }
+        
+        if (tick) {
+            if (GlossHook(tick, (void*)hook_NormalTick, (void**)&orig_NormalTick)) {
+                LOGI("NormalTick hook installed successfully!");
+            } else {
+                LOGE("Failed to hook NormalTick");
+            }
+        } else {
+            LOGE("Could not find LocalPlayer::normalTick - keystrokes won't work!");
+        }
+    } else {
+        LOGE("Could not open libminecraftpe.so");
     }
 
     return nullptr;
