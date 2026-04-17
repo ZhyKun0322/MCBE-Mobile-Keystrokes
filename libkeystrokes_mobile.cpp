@@ -1,6 +1,3 @@
-// MCBE_MobileKeystrokes_26.13.1.cpp
-// Complete working code for LeviLauncher on MCBE 26.13.1 (stripped symbols)
-
 #include <jni.h>
 #include <android/log.h>
 #include <android/input.h>
@@ -9,7 +6,6 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <mutex>
-#include <atomic>
 
 #include "pl/Gloss.h"
 #include "imgui.h"
@@ -80,9 +76,9 @@ struct KeySettings {
 static KeyState         g_keys;
 static KeySettings      g_settings;
 static std::mutex       g_keyMutex;
-static std::atomic<bool> g_initialized{false};
-static std::atomic<bool> g_showSettings{false};
-static std::atomic<bool> g_scanComplete{false};
+static bool             g_initialized = false;
+static bool             g_showSettings = false;
+static bool             g_scanComplete = false;
 static int              g_micOffset = 0;
 static void*            g_playerPtr = nullptr;
 static int              g_tickCount = 0;
@@ -523,10 +519,6 @@ void* main_thread(void*) {
             if (base) {
                 LOGI("[INFO] libminecraftpe.so base: 0x%lx", base);
                 LOGI("[INFO] Need to find NormalTick offset manually");
-                
-                // TODO: Add pattern scanning here
-                // For now, the mod will show UI but won't detect keys
-                // until we find the offset via runtime scanning
             }
         }
         
