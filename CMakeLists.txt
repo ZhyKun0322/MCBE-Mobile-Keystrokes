@@ -4,32 +4,42 @@ project(keystrokes LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Optimization Flags
+# Optimization flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -fexceptions -w")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -w")
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -w")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--strip-all -s")
 
 include(FetchContent)
 
-# 1. Fetch fmt (Dependency for Preloader)
-FetchContent_Declare(fmt GIT_REPOSITORY https://github.com/fmtlib/fmt.git GIT_TAG 10.2.1)
+# 1. fmt  (required by preloader)
+FetchContent_Declare(fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG 10.2.1)
 FetchContent_MakeAvailable(fmt)
 
-# 2. Fetch Preloader (LiteLDev Official)
-FetchContent_Declare(preloader GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git GIT_TAG main)
+# 2. Preloader  (provides pl/Hook.h and pl/Gloss.h)
+FetchContent_Declare(preloader
+    GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git
+    GIT_TAG main)
 FetchContent_MakeAvailable(preloader)
-
 target_link_libraries(preloader PUBLIC fmt::fmt)
 
-# 3. Setup Include Directories (Matching your Capital 'I' folder)
+# 3. entt  (header-only, provides entt/entt.hpp)
+FetchContent_Declare(entt
+    GIT_REPOSITORY https://github.com/skypjack/entt.git
+    GIT_TAG v3.13.0)
+FetchContent_MakeAvailable(entt)
+
+# 4. Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/Include
     ${CMAKE_SOURCE_DIR}/Include/ImGui
     ${CMAKE_SOURCE_DIR}/Include/ImGui/backends
     ${CMAKE_SOURCE_DIR}/Include/pl
+    ${entt_SOURCE_DIR}/single_include   # provides entt/entt.hpp
 )
 
-# 4. Set Sources (Matching libkeystrokes_mobile.cpp and Capital 'I' Include)
+# 5. Sources
 set(SOURCES
     libkeystrokes_mobile.cpp
     Include/ImGui/imgui.cpp
@@ -42,12 +52,13 @@ set(SOURCES
 
 add_library(keystrokes SHARED ${SOURCES})
 
-# 5. Link everything
-target_link_libraries(keystrokes 
-    preloader 
-    log 
-    android 
-    EGL 
-    GLESv3 
+# 6. Link
+target_link_libraries(keystrokes
+    preloader
+    EnTT::EnTT
+    log
+    android
+    EGL
+    GLESv3
     GLESv2
 )
