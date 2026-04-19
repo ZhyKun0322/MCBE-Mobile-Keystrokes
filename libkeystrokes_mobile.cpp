@@ -114,17 +114,20 @@ struct MoveSnapshot {
 static MoveSnapshot g_snap;
 static std::mutex   g_snapMtx;
 
-using fn_normalTick_t = void(*)(void*);
+using fn_normalTick_t = void(*)(void*, void*, void*);
 static fn_normalTick_t orig_normalTick = nullptr;
 
-static void hook_normalTick(void* thiz) {
+static void hook_normalTick(void* sys, void* player, void* arg2) {
     // Call original FIRST — component is fully updated before we read it.
-    orig_normalTick(thiz);
+    orig_normalTick(sys, player, arg2);
 
     // thiz = second argument of normalTick (x1 in AArch64 calling convention).
     // Confirmed via disassembly: the callee at 0xaa6d138+0x018 does
     // ldr x8,[x0,#0x10], matching ENTITY_CTX_OFF exactly.
-    uintptr_t base = reinterpret_cast<uintptr_t>(thiz);
+    // player = x1 (confirmed via disassembly of 0xaa6cbfc):
+    // stp x0,x9,[sp,#8] then mov x24,x1 — x1 is the Actor/player.
+    // The callee at 0xaa6d138+0x018 does ldr x8,[x0,#0x10] with x0=x1.
+    uintptr_t base = reinterpret_cast<uintptr_t>(player);
     if (!sane(base)) return;
 
     // Read EntityContext pointer at player+0x10
