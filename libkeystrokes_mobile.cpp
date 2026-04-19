@@ -121,16 +121,15 @@ static void hook_normalTick(void* thiz) {
 // ══════════════════════════════════════════════════════════════════════════
 //  Path A — entt registry lookup (fast, uses ENTITY_CTX_OFF = 0x10)
 // ══════════════════════════════════════════════════════════════════════════
-static MoveInputComponent* getMoveInput_entt(void* lp) {
-    uintptr_t base = reinterpret_cast<uintptr_t>(lp);
-    if (!readable(base + ENTITY_CTX_OFF, 8)) return nullptr;
+auto* registry = ctx->registry;
+    if (!registry) return nullptr;
+    if (!readable(reinterpret_cast<uintptr_t>(registry), 64)) return nullptr;
 
-    auto* ctx = *reinterpret_cast<McEntityCtx**>(base + ENTITY_CTX_OFF);
-    if (!ctx) return nullptr;
-    if (!readable(reinterpret_cast<uintptr_t>(ctx), sizeof(McEntityCtx))) return nullptr;
-    if (!readable(reinterpret_cast<uintptr_t>(ctx->registry), 8)) return nullptr;
+    // Validate entity handle before passing to entt
+    if (ctx->entity == entt::null) return nullptr;
+    if (!registry->valid(ctx->entity)) return nullptr;
 
-    return ctx->registry->try_get<MoveInputComponent>(ctx->entity);
+    return registry->try_get<MoveInputComponent>(ctx->entity);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
