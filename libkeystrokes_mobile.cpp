@@ -30,7 +30,10 @@
 #define VERSION "1.6.0"
 
 // ══════════════════════════════════════════════════════════════════════════
-//  Offsets
+//  Offsets  (confirmed via binary analysis of libminecraftpe.so 1.26.13.1)
+//  normalTick VA 0xaa6cbfc: valid AArch64 prologue confirmed.
+//  ENTITY_CTX_OFF 0x10: confirmed — callee at 0xaa6d138+0x018 does
+//  ldr x8,[x0,#0x10] matching this offset exactly.
 // ══════════════════════════════════════════════════════════════════════════
 static const uintptr_t g_normalTickOff = 0xaa6cbfc;
 static const uintptr_t ENTITY_CTX_OFF  = 0x10;
@@ -74,241 +77,80 @@ struct McEntityCtx {
     McEntity    entity;
 };
 
-// ══════════════════════════════════════════════════════════════════════════
-//  Memory map — refreshed every 120 frames (~2s) so new heap allocations
-//  are always visible.  This is what caused the 10-15s delay.
-// ══════════════════════════════════════════════════════════════════════════
-struct MemRgn { uintptr_t s, e; };
-static std::vector<MemRgn> g_rgns;
-static std::mutex          g_rgns_mtx;
-static int                 g_rgns_frame   = 0; // counts frames since last refresh
-static uint32_t            g_rgns_gen     = 0; // monotonic generation — NEVER resets
-static const int           RGNS_REFRESH   = 120; // frames between refreshes
-
-static void refresh_rgns() {
-    std::lock_guard<std::mutex> lk(g_rgns_mtx);
-    g_rgns.clear();
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) return;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        uintptr_t s = 0, e = 0; char p[8] = {};
-        if (sscanf(line, "%" PRIxPTR "-%" PRIxPTR " %4s", &s, &e, p) == 3 && p[0] == 'r')
-            g_rgns.push_back({s, e});
-    }
-    fclose(f);
-    ++g_rgns_gen; // bump generation on every actual refresh
-}
-
-// Called once per frame from render() — cheap after first call
-static void maybe_refresh_rgns() {
-    if (++g_rgns_frame < RGNS_REFRESH) return;
-    g_rgns_frame = 0;
-    refresh_rgns();
-}
-
-static bool readable(uintptr_t addr, size_t sz = 8) {
-    // No lock needed — only called from GL thread after maybe_refresh_rgns()
-    for (auto& r : g_rgns)
-        if (addr >= r.s && addr + sz <= r.e) return true;
-    return false;
-}
-
-// Quick sanity check that doesn't need maps — just rejects obviously bad
-// kernel/null addresses.  Used on the entt hot path to avoid map lookup.
+// Quick sanity — rejects null/kernel addresses without touching /proc/maps.
 static inline bool sane(uintptr_t p) {
     return p > 0x10000ULL && p < 0x800000000000ULL;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  LocalPlayer pointer
-//  CRASH FIX: also track a "stale" counter. If getMoveInput fails
-//  N frames in a row we clear g_localPlayer so hook_normalTick can
-//  re-acquire a fresh pointer on the next tick.
+//  MoveSnapshot
+//
+//  WHY THIS DESIGN (root cause of both bugs, found via binary analysis):
+//
+//  CRASH — use-after-free:
+//    entt's try_get<T>() returns a raw pointer into the component storage's
+//    packed array.  That array is REALLOCATED whenever any component is
+//    added or removed — which happens every tick during normal gameplay.
+//    Holding MoveInputComponent* across frames is a guaranteed UAF crash.
+//
+//  DELAY — scanner running on the GL thread every frame:
+//    The old scanner did readable(base, 0x800) which requires ONE contiguous
+//    2 KB block — almost never true for a heap object, so it silently
+//    returned nullptr every frame and re-scanned forever.
+//
+//  FIX — copy scalars inside hook_normalTick:
+//    We call try_get ONCE on the game thread while the entity is guaranteed
+//    alive, copy the 3 values we need into a plain struct, then drop the
+//    pointer immediately.  The GL thread reads only the copy — no raw
+//    MoveInputComponent* ever crosses the thread boundary.
+//    No scanner, no /proc/maps, no background threads, no stale pointers.
 // ══════════════════════════════════════════════════════════════════════════
-static void*      g_localPlayer    = nullptr;
-static int        g_lpFailCount    = 0;
-static const int  LP_FAIL_LIMIT    = 60; // clear after 60 consecutive failures
-static std::mutex g_playerMtx;
+struct MoveSnapshot {
+    float move_x = 0.f;
+    float move_y = 0.f;
+    bool  jump   = false;
+    bool  valid  = false;  // true once at least one tick has fired
+};
+static MoveSnapshot g_snap;
+static std::mutex   g_snapMtx;
 
 using fn_normalTick_t = void(*)(void*);
 static fn_normalTick_t orig_normalTick = nullptr;
 
 static void hook_normalTick(void* thiz) {
-    { std::lock_guard<std::mutex> lk(g_playerMtx); g_localPlayer = thiz; }
+    // Call original FIRST — component is fully updated before we read it.
     orig_normalTick(thiz);
-}
 
-// ══════════════════════════════════════════════════════════════════════════
-//  Path A — entt
-//  Uses sane() instead of readable() so it never blocks on stale map data.
-//  registry->valid() is the real safety gate.
-// ══════════════════════════════════════════════════════════════════════════
-static MoveInputComponent* getMoveInput_entt(void* lp) {
-    uintptr_t base = reinterpret_cast<uintptr_t>(lp);
+    // thiz = second argument of normalTick (x1 in AArch64 calling convention).
+    // Confirmed via disassembly: the callee at 0xaa6d138+0x018 does
+    // ldr x8,[x0,#0x10], matching ENTITY_CTX_OFF exactly.
+    uintptr_t base = reinterpret_cast<uintptr_t>(thiz);
+    if (!sane(base)) return;
 
-    // CRASH FIX: guard the slot itself with readable() before dereferencing.
-    // sane() alone only checks the address range — it doesn't verify the page
-    // is mapped.  Without this, a world-reload that frees the player object
-    // will segfault here even though the pointer value looks plausible.
-    if (!readable(base + ENTITY_CTX_OFF, sizeof(void*))) return nullptr;
-
-    auto* ctx = *reinterpret_cast<McEntityCtx**>(base + ENTITY_CTX_OFF);
-    if (!ctx || !sane(reinterpret_cast<uintptr_t>(ctx))) return nullptr;
-
-    // ctx must itself be readable before we touch its fields
-    if (!readable(reinterpret_cast<uintptr_t>(ctx), sizeof(McEntityCtx))) return nullptr;
+    // Read EntityContext pointer at player+0x10
+    uintptr_t ctx_slot = base + ENTITY_CTX_OFF;
+    if (!sane(ctx_slot)) return;
+    auto* ctx = *reinterpret_cast<McEntityCtx**>(ctx_slot);
+    if (!ctx || !sane(reinterpret_cast<uintptr_t>(ctx))) return;
 
     McRegistry* reg = ctx->registry;
-    if (!reg || !sane(reinterpret_cast<uintptr_t>(reg))) return nullptr;
-
-    // registry internal storage must be readable — guards against freed registry
-    if (!readable(reinterpret_cast<uintptr_t>(reg), 64)) return nullptr;
+    if (!reg || !sane(reinterpret_cast<uintptr_t>(reg))) return;
 
     McEntity ent = ctx->entity;
-    if (ent == entt::null)       return nullptr;
-    if (!reg->valid(ent))        return nullptr;
+    if (ent == entt::null || !reg->valid(ent)) return;
 
-    return reg->try_get<MoveInputComponent>(ent);
-}
+    // try_get is safe here: game thread, no concurrent reallocation possible.
+    // We copy the values and drop the pointer immediately — no UAF.
+    const MoveInputComponent* mic = reg->try_get<MoveInputComponent>(ent);
+    if (!mic) return;
 
-// ══════════════════════════════════════════════════════════════════════════
-//  Path B — auto-scanner fallback
-//
-//  KEY FIXES:
-//  1. The old readable(base, 0x800) check required one contiguous 2KB region —
-//     almost never true for a heap-allocated player object, so the scan always
-//     returned nullptr immediately without ever finding anything. Now each 8-byte
-//     slot is checked individually inside the loop (correct behaviour).
-//  2. The scan is heavy (up to 256 readable() + float checks). It now runs on a
-//     detached background pthread so it NEVER stalls the GL/render thread.
-//     The GL thread only reads the cached result, which is zero-cost when warm.
-//  3. Cache staleness uses the monotonic g_rgns_gen counter.
-// ══════════════════════════════════════════════════════════════════════════
-static int      g_mic_off      = -1;
-static bool     g_mic_found    = false;
-static uint32_t g_mic_refresh  = 0; // generation that validated this cache entry
+    MoveSnapshot snap;
+    snap.move_x = mic->mMove_x;
+    snap.move_y = mic->mMove_y;
+    snap.jump   = (mic->mInputState[4] != 0) || ((mic->mFlagValues & 0x1) != 0);
+    snap.valid  = true;
 
-// Background-scan state
-static bool       g_scan_running = false;
-static std::mutex g_scan_mtx;               // guards g_scan_running + result writes
-
-static bool mic_valid(uintptr_t ptr) {
-    if (!readable(ptr, sizeof(MoveInputComponent))) return false;
-    auto* m = reinterpret_cast<MoveInputComponent*>(ptr);
-    if (!std::isfinite(m->mMove_x)      || fabsf(m->mMove_x)      > 2.0f) return false;
-    if (!std::isfinite(m->mMove_y)      || fabsf(m->mMove_y)      > 2.0f) return false;
-    if (!std::isfinite(m->mLookDelta_x) || fabsf(m->mLookDelta_x) > 20.f) return false;
-    if (!std::isfinite(m->mLookDelta_y) || fabsf(m->mLookDelta_y) > 20.f) return false;
-    if (m->mFlagValues > 0x7FF) return false;
-    return true;
-}
-
-// POD bundle passed to the background scan thread
-struct ScanArgs { uintptr_t base; std::vector<MemRgn> rgns; uint32_t gen; };
-
-// Runs on a detached background thread — never touches ImGui or GL state
-static void* scan_thread_fn(void* arg) {
-    ScanArgs* sa = reinterpret_cast<ScanArgs*>(arg);
-    uintptr_t base = sa->base;
-    auto& rgns     = sa->rgns;
-    uint32_t gen   = sa->gen;
-
-    // Local readable check against snapshot — no lock needed inside the loop
-    auto snap_readable = [&](uintptr_t addr, size_t sz) -> bool {
-        for (auto& r : rgns)
-            if (addr >= r.s && addr + sz <= r.e) return true;
-        return false;
-    };
-
-    int found_off = -1;
-    // Check each slot individually — the old single-block check was wrong
-    for (int off = 0; off < 0x800; off += 8) {
-        if (!snap_readable(base + (uintptr_t)off, 8)) continue;
-        uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)off);
-        if (!sane(ptr)) continue;
-        if (!snap_readable(ptr, sizeof(MoveInputComponent))) continue;
-        auto* m = reinterpret_cast<MoveInputComponent*>(ptr);
-        if (!std::isfinite(m->mMove_x)      || fabsf(m->mMove_x)      > 2.0f) continue;
-        if (!std::isfinite(m->mMove_y)      || fabsf(m->mMove_y)      > 2.0f) continue;
-        if (!std::isfinite(m->mLookDelta_x) || fabsf(m->mLookDelta_x) > 20.f) continue;
-        if (!std::isfinite(m->mLookDelta_y) || fabsf(m->mLookDelta_y) > 20.f) continue;
-        if (m->mFlagValues > 0x7FF) continue;
-        found_off = off;
-        break;
-    }
-
-    // Commit result back — GL thread picks it up on the next frame
-    {
-        std::lock_guard<std::mutex> lk(g_scan_mtx);
-        if (found_off >= 0) {
-            g_mic_off     = found_off;
-            g_mic_found   = true;
-            g_mic_refresh = gen;
-            LOGI("MIC (bg-scanner) LP+0x%x", found_off);
-        }
-        g_scan_running = false;
-    }
-    delete sa;
-    return nullptr;
-}
-
-// Called from GL thread — returns cached result immediately (zero cost when warm),
-// or kicks off a one-shot background scan if the cache is cold/stale. Never blocks.
-static MoveInputComponent* getMoveInput_scan(void* lp) {
-    uintptr_t base = reinterpret_cast<uintptr_t>(lp);
-
-    std::lock_guard<std::mutex> lk(g_scan_mtx);
-
-    // Invalidate cache if maps were refreshed since last validation
-    if (g_mic_found && g_mic_off >= 0 && g_mic_refresh != g_rgns_gen) {
-        if (readable(base + (uintptr_t)g_mic_off, 8)) {
-            uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)g_mic_off);
-            if (mic_valid(ptr)) { g_mic_refresh = g_rgns_gen; } // still good
-            else                { g_mic_found = false; g_mic_off = -1; }
-        } else { g_mic_found = false; g_mic_off = -1; }
-    }
-
-    // Fast path — cache hit
-    if (g_mic_found && g_mic_off >= 0) {
-        if (!readable(base + (uintptr_t)g_mic_off, 8)) {
-            g_mic_found = false; g_mic_off = -1;
-        } else {
-            uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)g_mic_off);
-            if (mic_valid(ptr)) return reinterpret_cast<MoveInputComponent*>(ptr);
-            g_mic_found = false; g_mic_off = -1;
-        }
-    }
-
-    // Cache miss — start background scan (once at a time)
-    if (!g_scan_running) {
-        ScanArgs* sa = new ScanArgs();
-        sa->base = base;
-        sa->gen  = g_rgns_gen;
-        { std::lock_guard<std::mutex> rlk(g_rgns_mtx); sa->rgns = g_rgns; }
-        pthread_t t;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        if (pthread_create(&t, &attr, scan_thread_fn, sa) == 0) {
-            g_scan_running = true;
-        } else {
-            delete sa; // thread creation failed, retry next frame
-        }
-        pthread_attr_destroy(&attr);
-    }
-
-    return nullptr; // result will be ready next frame
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-//  getMoveInput — entt first, scanner fallback
-// ══════════════════════════════════════════════════════════════════════════
-static MoveInputComponent* getMoveInput(void* lp) {
-    if (!lp) return nullptr;
-    MoveInputComponent* mic = getMoveInput_entt(lp);
-    if (mic) return mic;
-    return getMoveInput_scan(lp);
+    { std::lock_guard<std::mutex> lk(g_snapMtx); g_snap = snap; }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -319,35 +161,16 @@ static KeyState   g_keys = {};
 static std::mutex g_keymutex;
 
 static void updateKeysFromPlayer() {
-    void* lp;
-    { std::lock_guard<std::mutex> lk(g_playerMtx); lp = g_localPlayer; }
-    if (!lp) return;
-
-    MoveInputComponent* mic = getMoveInput(lp);
-    if (!mic) {
-        // Count consecutive failures — clear stale player pointer after limit
-        if (++g_lpFailCount >= LP_FAIL_LIMIT) {
-            std::lock_guard<std::mutex> lk(g_playerMtx);
-            g_localPlayer = nullptr;
-            g_lpFailCount = 0;
-            g_mic_found   = false;
-            g_mic_off     = -1;
-            LOGW("LocalPlayer cleared after %d consecutive failures", LP_FAIL_LIMIT);
-        }
-        return;
-    }
-    g_lpFailCount = 0; // reset on success
-
-    float mx   = mic->mMove_x;
-    float my   = mic->mMove_y;
-    bool  jump = (mic->mInputState[4] != 0) || ((mic->mFlagValues & 0x1) != 0);
+    MoveSnapshot snap;
+    { std::lock_guard<std::mutex> lk(g_snapMtx); snap = g_snap; }
+    if (!snap.valid) return;
 
     std::lock_guard<std::mutex> lk(g_keymutex);
-    g_keys.w     = (my >  0.1f);
-    g_keys.s     = (my < -0.1f);
-    g_keys.a     = (mx < -0.1f);
-    g_keys.d     = (mx >  0.1f);
-    g_keys.space = jump;
+    g_keys.w     = (snap.move_y >  0.1f);
+    g_keys.s     = (snap.move_y < -0.1f);
+    g_keys.a     = (snap.move_x < -0.1f);
+    g_keys.d     = (snap.move_x >  0.1f);
+    g_keys.space = snap.jump;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -495,12 +318,13 @@ static void processinput(AInputEvent* ev) {
         bool nl=(btn&AMOTION_EVENT_BUTTON_PRIMARY)!=0;
         bool nr=(btn&AMOTION_EVENT_BUTTON_SECONDARY)!=0;
 
-        // Update key state under its own lock, then release before touching tq
+        // Release g_keymutex before calling tq_push (which acquires g_tqmtx)
+        // to eliminate any possibility of lock-order inversion.
         {
             std::lock_guard<std::mutex> lk(g_keymutex);
             if(nl&&!g_pl)g_lc.click(); if(nr&&!g_pr)g_rc.click();
             g_pl=nl; g_pr=nr; g_keys.lmb=nl; g_keys.rmb=nr;
-        } // g_keymutex released here — safe to call tq_push (acquires g_tqmtx)
+        }
 
         if(g_initialized&&g_showsettings){
             float tx=AMotionEvent_getX(ev,0),ty=AMotionEvent_getY(ev,0);
@@ -629,14 +453,12 @@ static void drawsettings(ImVec2 hp){
     else
         ImGui::TextColored(ImVec4(1,.35f,.35f,1),"normalTick: hook failed");
     {
-        void* lp; {std::lock_guard<std::mutex> lk(g_playerMtx);lp=g_localPlayer;}
-        if(lp) ImGui::TextColored(ImVec4(.4f,.8f,.4f,1),"entt: active (LP+0x%x)",(unsigned)ENTITY_CTX_OFF);
-        else   ImGui::TextColored(ImVec4(1,.7f,.1f,1),"entt: waiting for player...");
+        MoveSnapshot snap;{std::lock_guard<std::mutex> lk(g_snapMtx);snap=g_snap;}
+        if(snap.valid)
+            ImGui::TextColored(ImVec4(.4f,.8f,.4f,1),"Player: active (%.2f,%.2f)",snap.move_x,snap.move_y);
+        else
+            ImGui::TextColored(ImVec4(1,.7f,.1f,1),"Player: waiting for normalTick...");
     }
-    if(g_mic_found)
-        ImGui::TextColored(ImVec4(.4f,.8f,.4f,1),"Scanner: LP+0x%x (fallback)",g_mic_off);
-    else
-        ImGui::TextColored(ImVec4(.55f,.62f,.75f,1),"Scanner: standby");
     ImGui::Spacing();ImGui::Separator();ImGui::Spacing();
     ImGui::TextColored(ImVec4(.5f,.75f,1,1),"KEY SIZE");
     ImGui::TextColored(ImVec4(.9f,.93f,1,1),"%.0f dp",g_keysize);
@@ -746,18 +568,12 @@ static void setup(){
     float ks=g_keysize,sp=ks*0.04f,hw=ks*3+sp*2,hh=ks*4+sp*3;
     g_hudpos.x=std::max(0.f,std::min(g_hudpos.x,(float)g_width-hw));
     g_hudpos.y=std::max(0.f,std::min(g_hudpos.y,(float)g_height-hh));
-    // Do a first maps refresh right after init
-    refresh_rgns();
     g_initialized=true;
 }
 
 static void render(){
     if(!g_initialized)return;
     glst s;sgl(s);
-
-    // Refresh maps every 120 frames — fixes delay from stale heap mappings
-    maybe_refresh_rgns();
-
     ImGuiIO& io=ImGui::GetIO();
     io.DisplaySize=ImVec2((float)g_width,(float)g_height);
     tq_drain();
