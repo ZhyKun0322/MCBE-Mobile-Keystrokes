@@ -27,7 +27,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
-#define VERSION "1.5.0"
+#define VERSION "1.5.1"
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Offsets  (found via Termux scripts for MC 1.26.13.1)
@@ -119,22 +119,36 @@ static void hook_normalTick(void* thiz) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  Path A — entt registry lookup (fast, uses ENTITY_CTX_OFF = 0x10)
+//  Path A — entt registry lookup
+//  CRASH FIX: validate registry pointer + entity handle before any entt call
 // ══════════════════════════════════════════════════════════════════════════
-auto* registry = ctx->registry;
+static MoveInputComponent* getMoveInput_entt(void* lp) {
+    uintptr_t base = reinterpret_cast<uintptr_t>(lp);
+    if (!readable(base + ENTITY_CTX_OFF, 8)) return nullptr;
+
+    auto* ctx = *reinterpret_cast<McEntityCtx**>(base + ENTITY_CTX_OFF);
+    if (!ctx) return nullptr;
+    if (!readable(reinterpret_cast<uintptr_t>(ctx), sizeof(McEntityCtx))) return nullptr;
+
+    McRegistry* registry = ctx->registry;
     if (!registry) return nullptr;
+
+    // Validate the registry pointer itself — must be readable for at least
+    // 64 bytes so entt's internal sparse set access doesn't segfault
     if (!readable(reinterpret_cast<uintptr_t>(registry), 64)) return nullptr;
 
-    // Validate entity handle before passing to entt
-    if (ctx->entity == entt::null) return nullptr;
-    if (!registry->valid(ctx->entity)) return nullptr;
+    McEntity entity = ctx->entity;
 
-    return registry->try_get<MoveInputComponent>(ctx->entity);
+    // Guard against null/invalid entity handle — this was the crash cause
+    if (entity == entt::null) return nullptr;
+    if (!registry->valid(entity)) return nullptr;
+
+    return registry->try_get<MoveInputComponent>(entity);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Path B — auto-scanner fallback
-//  Used if entt path returns nullptr (e.g. wrong offset, component not yet set)
+//  Used if entt path returns nullptr
 // ══════════════════════════════════════════════════════════════════════════
 static int  g_mic_off   = -1;
 static bool g_mic_found = false;
@@ -453,7 +467,7 @@ static void drawkeycps(const char* lbl, bool on, ImVec2 sz, int cps) {
     ImGui::Button("##ck", sz);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImFont*     fn = ImGui::GetFont();
-    float fs = ImGui::GetFontSize(), sfs = fs * 0.75f;
+    float fs = ImGui::GetFontSize(), sfs = fs*0.75f;
     ImVec2 lsz = fn->CalcTextSizeA(fs,  FLT_MAX, 0, lbl);
     char cb[16]; snprintf(cb, 16, "%d CPS", cps);
     ImVec2 csz = fn->CalcTextSizeA(sfs, FLT_MAX, 0, cb);
@@ -502,7 +516,6 @@ static void drawsettings(ImVec2 hp) {
     ImGui::TextColored(ImVec4(.85f,.92f,1,1), "KEYSTROKES  v" VERSION);
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    // Status
     if (g_consume_variant >= 0)
         ImGui::TextColored(ImVec4(.4f,.8f,.4f,1), "Input hook: variant %d", g_consume_variant);
     else
@@ -518,7 +531,7 @@ static void drawsettings(ImVec2 hp) {
     ImGui::TextColored(ImVec4(.4f,.8f,.4f,1), "entt: active (LP+0x%x)", (unsigned)ENTITY_CTX_OFF);
 
     if (g_mic_found)
-        ImGui::TextColored(ImVec4(.4f,.8f,.4f,1), "Scanner: LP+0x%x (fallback used)", g_mic_off);
+        ImGui::TextColored(ImVec4(.4f,.8f,.4f,1), "Scanner: LP+0x%x (fallback)", g_mic_off);
     else
         ImGui::TextColored(ImVec4(.55f,.62f,.75f,1), "Scanner: standby");
 
@@ -656,11 +669,11 @@ static void render() {
     glst s; sgl(s);
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)g_width, (float)g_height);
-    tq_drain();                   // GL thread — safe for ImGui
+    tq_drain();
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
-    updateKeysFromPlayer();       // GL thread — safe
+    updateKeysFromPlayer();
     drawmenu();
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -686,7 +699,6 @@ static void* mainthread(void*) {
     sleep(5);
     GlossInit(true);
 
-    // eglSwapBuffers
     GHandle hegl = GlossOpen("libEGL.so");
     void* swap   = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
     if (!swap) {
@@ -695,7 +707,6 @@ static void* mainthread(void*) {
     }
     if (swap) GlossHook(swap, (void*)hook_swap, (void**)&orig_swap);
 
-    // InputConsumer::consume
     GHandle hlib = GlossOpen("libinput.so");
     void*   sc   = nullptr;
     for (int i = 0; consume_syms[i]; i++) {
@@ -713,7 +724,6 @@ static void* mainthread(void*) {
         }
     }
 
-    // LocalPlayer::normalTick
     findMcBase();
     if (g_baseFound && g_normalTickOff != 0) {
         void* sym = reinterpret_cast<void*>(g_mcBase + g_normalTickOff);
