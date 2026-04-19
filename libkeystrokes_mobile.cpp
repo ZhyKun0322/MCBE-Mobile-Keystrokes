@@ -81,8 +81,9 @@ struct McEntityCtx {
 struct MemRgn { uintptr_t s, e; };
 static std::vector<MemRgn> g_rgns;
 static std::mutex          g_rgns_mtx;
-static int                 g_rgns_frame = 0;
-static const int           RGNS_REFRESH = 120; // frames between refreshes
+static int                 g_rgns_frame   = 0; // counts frames since last refresh
+static uint32_t            g_rgns_gen     = 0; // monotonic generation — NEVER resets
+static const int           RGNS_REFRESH   = 120; // frames between refreshes
 
 static void refresh_rgns() {
     std::lock_guard<std::mutex> lk(g_rgns_mtx);
@@ -96,6 +97,7 @@ static void refresh_rgns() {
             g_rgns.push_back({s, e});
     }
     fclose(f);
+    ++g_rgns_gen; // bump generation on every actual refresh
 }
 
 // Called once per frame from render() — cheap after first call
@@ -167,9 +169,9 @@ static MoveInputComponent* getMoveInput_entt(void* lp) {
 //  Uses readable() which is always fresh after maybe_refresh_rgns().
 //  Cache is cleared whenever maps refresh.
 // ══════════════════════════════════════════════════════════════════════════
-static int  g_mic_off      = -1;
-static bool g_mic_found    = false;
-static int  g_mic_refresh  = 0; // tracks which maps generation found this
+static int      g_mic_off      = -1;
+static bool     g_mic_found    = false;
+static uint32_t g_mic_refresh  = 0; // generation that validated this cache entry
 
 static bool mic_valid(uintptr_t ptr) {
     if (!readable(ptr, sizeof(MoveInputComponent))) return false;
@@ -185,11 +187,11 @@ static bool mic_valid(uintptr_t ptr) {
 static MoveInputComponent* getMoveInput_scan(void* lp) {
     uintptr_t base = reinterpret_cast<uintptr_t>(lp);
 
-    // Invalidate cache when maps have been refreshed
-    if (g_mic_found && g_mic_refresh != g_rgns_frame) {
+    // Invalidate cache when maps have been refreshed (use monotonic generation)
+    if (g_mic_found && g_mic_off >= 0 && g_mic_refresh != g_rgns_gen) {
         uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + g_mic_off);
         if (!mic_valid(ptr)) { g_mic_found = false; g_mic_off = -1; }
-        else g_mic_refresh = g_rgns_frame;
+        else g_mic_refresh = g_rgns_gen;
     }
 
     if (g_mic_found) {
@@ -207,7 +209,7 @@ static MoveInputComponent* getMoveInput_scan(void* lp) {
         if (mic_valid(ptr)) {
             g_mic_off     = off;
             g_mic_found   = true;
-            g_mic_refresh = g_rgns_frame;
+            g_mic_refresh = g_rgns_gen;
             LOGI("MIC (scanner) LP+0x%x  move=(%f,%f)", off,
                  reinterpret_cast<MoveInputComponent*>(ptr)->mMove_x,
                  reinterpret_cast<MoveInputComponent*>(ptr)->mMove_y);
@@ -405,14 +407,19 @@ static bool  g_td=false;
 // ── processinput  (INPUT THREAD — no ImGui calls here) ───────────────────
 static void processinput(AInputEvent* ev) {
     int32_t type = AInputEvent_getType(ev);
-    std::lock_guard<std::mutex> lk(g_keymutex);
     if (type == AINPUT_EVENT_TYPE_MOTION) {
         int32_t act = AMotionEvent_getAction(ev)&AMOTION_EVENT_ACTION_MASK;
         int32_t btn = AMotionEvent_getButtonState(ev);
         bool nl=(btn&AMOTION_EVENT_BUTTON_PRIMARY)!=0;
         bool nr=(btn&AMOTION_EVENT_BUTTON_SECONDARY)!=0;
-        if(nl&&!g_pl)g_lc.click(); if(nr&&!g_pr)g_rc.click();
-        g_pl=nl; g_pr=nr; g_keys.lmb=nl; g_keys.rmb=nr;
+
+        // Update key state under its own lock, then release before touching tq
+        {
+            std::lock_guard<std::mutex> lk(g_keymutex);
+            if(nl&&!g_pl)g_lc.click(); if(nr&&!g_pr)g_rc.click();
+            g_pl=nl; g_pr=nr; g_keys.lmb=nl; g_keys.rmb=nr;
+        } // g_keymutex released here — safe to call tq_push (acquires g_tqmtx)
+
         if(g_initialized&&g_showsettings){
             float tx=AMotionEvent_getX(ev,0),ty=AMotionEvent_getY(ev,0);
             if(act==AMOTION_EVENT_ACTION_DOWN){
