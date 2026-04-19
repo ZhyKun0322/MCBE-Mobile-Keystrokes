@@ -146,10 +146,18 @@ static void hook_normalTick(void* thiz) {
 // ══════════════════════════════════════════════════════════════════════════
 static MoveInputComponent* getMoveInput_entt(void* lp) {
     uintptr_t base = reinterpret_cast<uintptr_t>(lp);
-    if (!sane(base + ENTITY_CTX_OFF)) return nullptr;
+
+    // CRASH FIX: guard the slot itself with readable() before dereferencing.
+    // sane() alone only checks the address range — it doesn't verify the page
+    // is mapped.  Without this, a world-reload that frees the player object
+    // will segfault here even though the pointer value looks plausible.
+    if (!readable(base + ENTITY_CTX_OFF, sizeof(void*))) return nullptr;
 
     auto* ctx = *reinterpret_cast<McEntityCtx**>(base + ENTITY_CTX_OFF);
     if (!ctx || !sane(reinterpret_cast<uintptr_t>(ctx))) return nullptr;
+
+    // ctx must itself be readable before we touch its fields
+    if (!readable(reinterpret_cast<uintptr_t>(ctx), sizeof(McEntityCtx))) return nullptr;
 
     McRegistry* reg = ctx->registry;
     if (!reg || !sane(reinterpret_cast<uintptr_t>(reg))) return nullptr;
@@ -166,12 +174,24 @@ static MoveInputComponent* getMoveInput_entt(void* lp) {
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Path B — auto-scanner fallback
-//  Uses readable() which is always fresh after maybe_refresh_rgns().
-//  Cache is cleared whenever maps refresh.
+//
+//  KEY FIXES:
+//  1. The old readable(base, 0x800) check required one contiguous 2KB region —
+//     almost never true for a heap-allocated player object, so the scan always
+//     returned nullptr immediately without ever finding anything. Now each 8-byte
+//     slot is checked individually inside the loop (correct behaviour).
+//  2. The scan is heavy (up to 256 readable() + float checks). It now runs on a
+//     detached background pthread so it NEVER stalls the GL/render thread.
+//     The GL thread only reads the cached result, which is zero-cost when warm.
+//  3. Cache staleness uses the monotonic g_rgns_gen counter.
 // ══════════════════════════════════════════════════════════════════════════
 static int      g_mic_off      = -1;
 static bool     g_mic_found    = false;
 static uint32_t g_mic_refresh  = 0; // generation that validated this cache entry
+
+// Background-scan state
+static bool       g_scan_running = false;
+static std::mutex g_scan_mtx;               // guards g_scan_running + result writes
 
 static bool mic_valid(uintptr_t ptr) {
     if (!readable(ptr, sizeof(MoveInputComponent))) return false;
@@ -184,39 +204,101 @@ static bool mic_valid(uintptr_t ptr) {
     return true;
 }
 
+// POD bundle passed to the background scan thread
+struct ScanArgs { uintptr_t base; std::vector<MemRgn> rgns; uint32_t gen; };
+
+// Runs on a detached background thread — never touches ImGui or GL state
+static void* scan_thread_fn(void* arg) {
+    ScanArgs* sa = reinterpret_cast<ScanArgs*>(arg);
+    uintptr_t base = sa->base;
+    auto& rgns     = sa->rgns;
+    uint32_t gen   = sa->gen;
+
+    // Local readable check against snapshot — no lock needed inside the loop
+    auto snap_readable = [&](uintptr_t addr, size_t sz) -> bool {
+        for (auto& r : rgns)
+            if (addr >= r.s && addr + sz <= r.e) return true;
+        return false;
+    };
+
+    int found_off = -1;
+    // Check each slot individually — the old single-block check was wrong
+    for (int off = 0; off < 0x800; off += 8) {
+        if (!snap_readable(base + (uintptr_t)off, 8)) continue;
+        uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)off);
+        if (!sane(ptr)) continue;
+        if (!snap_readable(ptr, sizeof(MoveInputComponent))) continue;
+        auto* m = reinterpret_cast<MoveInputComponent*>(ptr);
+        if (!std::isfinite(m->mMove_x)      || fabsf(m->mMove_x)      > 2.0f) continue;
+        if (!std::isfinite(m->mMove_y)      || fabsf(m->mMove_y)      > 2.0f) continue;
+        if (!std::isfinite(m->mLookDelta_x) || fabsf(m->mLookDelta_x) > 20.f) continue;
+        if (!std::isfinite(m->mLookDelta_y) || fabsf(m->mLookDelta_y) > 20.f) continue;
+        if (m->mFlagValues > 0x7FF) continue;
+        found_off = off;
+        break;
+    }
+
+    // Commit result back — GL thread picks it up on the next frame
+    {
+        std::lock_guard<std::mutex> lk(g_scan_mtx);
+        if (found_off >= 0) {
+            g_mic_off     = found_off;
+            g_mic_found   = true;
+            g_mic_refresh = gen;
+            LOGI("MIC (bg-scanner) LP+0x%x", found_off);
+        }
+        g_scan_running = false;
+    }
+    delete sa;
+    return nullptr;
+}
+
+// Called from GL thread — returns cached result immediately (zero cost when warm),
+// or kicks off a one-shot background scan if the cache is cold/stale. Never blocks.
 static MoveInputComponent* getMoveInput_scan(void* lp) {
     uintptr_t base = reinterpret_cast<uintptr_t>(lp);
 
-    // Invalidate cache when maps have been refreshed (use monotonic generation)
+    std::lock_guard<std::mutex> lk(g_scan_mtx);
+
+    // Invalidate cache if maps were refreshed since last validation
     if (g_mic_found && g_mic_off >= 0 && g_mic_refresh != g_rgns_gen) {
-        uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + g_mic_off);
-        if (!mic_valid(ptr)) { g_mic_found = false; g_mic_off = -1; }
-        else g_mic_refresh = g_rgns_gen;
+        if (readable(base + (uintptr_t)g_mic_off, 8)) {
+            uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)g_mic_off);
+            if (mic_valid(ptr)) { g_mic_refresh = g_rgns_gen; } // still good
+            else                { g_mic_found = false; g_mic_off = -1; }
+        } else { g_mic_found = false; g_mic_off = -1; }
     }
 
-    if (g_mic_found) {
-        if (!readable(base + g_mic_off, 8)) { g_mic_found = false; return nullptr; }
-        uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + g_mic_off);
-        if (mic_valid(ptr)) return reinterpret_cast<MoveInputComponent*>(ptr);
-        g_mic_found = false; g_mic_off = -1;
-    }
-
-    if (!readable(base, 0x800)) return nullptr;
-    for (int off = 0; off < 0x800; off += 8) {
-        if (!readable(base + off, 8)) continue;
-        uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + off);
-        if (!sane(ptr)) continue;
-        if (mic_valid(ptr)) {
-            g_mic_off     = off;
-            g_mic_found   = true;
-            g_mic_refresh = g_rgns_gen;
-            LOGI("MIC (scanner) LP+0x%x  move=(%f,%f)", off,
-                 reinterpret_cast<MoveInputComponent*>(ptr)->mMove_x,
-                 reinterpret_cast<MoveInputComponent*>(ptr)->mMove_y);
-            return reinterpret_cast<MoveInputComponent*>(ptr);
+    // Fast path — cache hit
+    if (g_mic_found && g_mic_off >= 0) {
+        if (!readable(base + (uintptr_t)g_mic_off, 8)) {
+            g_mic_found = false; g_mic_off = -1;
+        } else {
+            uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)g_mic_off);
+            if (mic_valid(ptr)) return reinterpret_cast<MoveInputComponent*>(ptr);
+            g_mic_found = false; g_mic_off = -1;
         }
     }
-    return nullptr;
+
+    // Cache miss — start background scan (once at a time)
+    if (!g_scan_running) {
+        ScanArgs* sa = new ScanArgs();
+        sa->base = base;
+        sa->gen  = g_rgns_gen;
+        { std::lock_guard<std::mutex> rlk(g_rgns_mtx); sa->rgns = g_rgns; }
+        pthread_t t;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &attr, scan_thread_fn, sa) == 0) {
+            g_scan_running = true;
+        } else {
+            delete sa; // thread creation failed, retry next frame
+        }
+        pthread_attr_destroy(&attr);
+    }
+
+    return nullptr; // result will be ready next frame
 }
 
 // ══════════════════════════════════════════════════════════════════════════
