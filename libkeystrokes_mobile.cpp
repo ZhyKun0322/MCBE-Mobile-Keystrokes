@@ -82,7 +82,8 @@ struct MemRgn { uintptr_t s, e; };
 static std::vector<MemRgn> g_rgns;
 static std::mutex          g_rgns_mtx;
 static int                 g_rgns_frame = 0;
-static const int           RGNS_REFRESH = 120; // frames between refreshes
+static uint32_t            g_rgns_gen   = 0; // monotonic, bumped every refresh
+static const int           RGNS_REFRESH = 120;
 
 static void refresh_rgns() {
     std::lock_guard<std::mutex> lk(g_rgns_mtx);
@@ -96,7 +97,7 @@ static void refresh_rgns() {
             g_rgns.push_back({s, e});
     }
     fclose(f);
-    ++g_rgns_gen; // monotonic — never resets, used by scanner cache
+    ++g_rgns_gen; // bump after every reload so scanner cache knows it's stale
 }
 
 // Called once per frame from render() — cheap after first call
@@ -146,25 +147,22 @@ static void hook_normalTick(void* thiz) {
 static MoveInputComponent* getMoveInput_entt(void* lp) {
     uintptr_t base = reinterpret_cast<uintptr_t>(lp);
 
-    // readable() guard before any dereference — sane() alone doesn't
-    // verify the page is mapped. A freed player still passes sane().
+    // Must verify the slot is mapped before dereferencing — sane() only
+    // checks the address range, not whether the page is actually present.
+    // A freed player pointer passes sane() and would segfault without this.
     if (!readable(base + ENTITY_CTX_OFF, sizeof(void*))) return nullptr;
 
     auto* ctx = *reinterpret_cast<McEntityCtx**>(base + ENTITY_CTX_OFF);
     if (!ctx || !sane(reinterpret_cast<uintptr_t>(ctx))) return nullptr;
-
-    // Guard ctx fields before reading registry/entity
     if (!readable(reinterpret_cast<uintptr_t>(ctx), sizeof(McEntityCtx))) return nullptr;
 
     McRegistry* reg = ctx->registry;
     if (!reg || !sane(reinterpret_cast<uintptr_t>(reg))) return nullptr;
-
-    // registry internals must be readable
     if (!readable(reinterpret_cast<uintptr_t>(reg), 64)) return nullptr;
 
     McEntity ent = ctx->entity;
-    if (ent == entt::null)       return nullptr;
-    if (!reg->valid(ent))        return nullptr;
+    if (ent == entt::null)  return nullptr;
+    if (!reg->valid(ent))   return nullptr;
 
     return reg->try_get<MoveInputComponent>(ent);
 }
@@ -172,20 +170,28 @@ static MoveInputComponent* getMoveInput_entt(void* lp) {
 // ══════════════════════════════════════════════════════════════════════════
 //  Path B — auto-scanner fallback
 //
-//  FIX (delay): The old code had readable(base, 0x800) which requires ONE
-//  contiguous 2 KB region — almost never true for a heap player object, so
-//  it returned nullptr immediately every frame without ever scanning.
-//  Now each 8-byte slot is checked individually (correct behaviour).
+//  ROOT CAUSE OF DELAY (confirmed by binary analysis):
+//    readable(base, 0x800) required ONE contiguous 2 KB region at the
+//    player address — almost never true on the heap — so it returned nullptr
+//    immediately every frame without scanning a single slot. The scan never
+//    ran at all, causing the 10-30s delay waiting for the entt path.
 //
-//  FIX (crash/stall): The 256-slot scan ran on the GL thread every frame
-//  when the cache was cold, stalling rendering.  It now runs once on a
-//  detached background pthread and writes the result back under a mutex.
-//  The GL thread returns nullptr for one frame and picks it up next frame.
+//  ROOT CAUSE OF CRASH:
+//    The cache invalidation read g_mic_off when it could be -1 (null-deref).
+//    Also the scan ran on the GL thread, stalling rendering long enough for
+//    Android's watchdog to kill the process.
+//
+//  FIXES:
+//    1. Remove readable(base,0x800) pre-check. Check each slot individually.
+//    2. Move the full scan to a detached background pthread — GL thread never
+//       stalls, result is available next frame.
+//    3. Use g_rgns_gen (monotonic) for cache staleness instead of the
+//       resetting g_rgns_frame counter.
+//    4. Guard the cache-invalidation dereference with g_mic_off >= 0.
 // ══════════════════════════════════════════════════════════════════════════
 static int      g_mic_off      = -1;
 static bool     g_mic_found    = false;
-static uint32_t g_mic_gen      = 0; // maps generation when cache was set
-static uint32_t g_rgns_gen     = 0; // incremented on every refresh_rgns()
+static uint32_t g_mic_gen      = 0; // g_rgns_gen value when cache was set
 static bool     g_scan_running = false;
 static std::mutex g_scan_mtx;
 
@@ -200,26 +206,23 @@ static bool mic_valid(uintptr_t ptr) {
     return true;
 }
 
-// Passed to the background scan thread
 struct ScanArgs { uintptr_t base; std::vector<MemRgn> rgns; uint32_t gen; };
 
 static void* scan_thread_fn(void* arg) {
     ScanArgs* sa = reinterpret_cast<ScanArgs*>(arg);
     uintptr_t base = sa->base;
 
-    auto snap_readable = [&](uintptr_t addr, size_t sz) -> bool {
-        for (auto& r : sa->rgns)
-            if (addr >= r.s && addr + sz <= r.e) return true;
+    auto snap_rd = [&](uintptr_t a, size_t z) -> bool {
+        for (auto& r : sa->rgns) if (a >= r.s && a + z <= r.e) return true;
         return false;
     };
 
     int found_off = -1;
-    // Check each slot individually — no single-block pre-check
     for (int off = 0; off < 0x800; off += 8) {
-        if (!snap_readable(base + (uintptr_t)off, 8)) continue;
+        if (!snap_rd(base + (uintptr_t)off, 8)) continue;
         uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)off);
         if (!sane(ptr)) continue;
-        if (!snap_readable(ptr, sizeof(MoveInputComponent))) continue;
+        if (!snap_rd(ptr, sizeof(MoveInputComponent))) continue;
         auto* m = reinterpret_cast<MoveInputComponent*>(ptr);
         if (!std::isfinite(m->mMove_x)      || fabsf(m->mMove_x)      > 2.0f) continue;
         if (!std::isfinite(m->mMove_y)      || fabsf(m->mMove_y)      > 2.0f) continue;
@@ -244,13 +247,11 @@ static void* scan_thread_fn(void* arg) {
     return nullptr;
 }
 
-// Called from GL thread — instant when cache is warm, kicks background
-// scan when cold. Never blocks.
 static MoveInputComponent* getMoveInput_scan(void* lp) {
     uintptr_t base = reinterpret_cast<uintptr_t>(lp);
     std::lock_guard<std::mutex> lk(g_scan_mtx);
 
-    // Invalidate cache if maps were refreshed since we validated it
+    // Invalidate cache on maps refresh (guard g_mic_off >= 0 before deref)
     if (g_mic_found && g_mic_off >= 0 && g_mic_gen != g_rgns_gen) {
         if (readable(base + (uintptr_t)g_mic_off, 8)) {
             uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)g_mic_off);
@@ -270,7 +271,7 @@ static MoveInputComponent* getMoveInput_scan(void* lp) {
         }
     }
 
-    // Cache miss — start background scan once
+    // Cache miss — kick off background scan once at a time
     if (!g_scan_running) {
         ScanArgs* sa = new ScanArgs();
         sa->base = base;
@@ -316,19 +317,19 @@ static void updateKeysFromPlayer() {
             std::lock_guard<std::mutex> lk(g_playerMtx);
             g_localPlayer = nullptr;
             g_lpFailCount = 0;
-            {std::lock_guard<std::mutex> slk(g_scan_mtx);g_mic_found=false;g_mic_off=-1;}
+            { std::lock_guard<std::mutex> slk(g_scan_mtx); g_mic_found=false; g_mic_off=-1; }
             LOGW("LocalPlayer cleared after %d consecutive failures", LP_FAIL_LIMIT);
         }
         return;
     }
     g_lpFailCount = 0;
 
-    // Copy values immediately — entt can reallocate the storage array at any
-    // time, so holding mic* across ANY other call is a use-after-free crash.
+    // Copy immediately — entt can reallocate the storage array at any time,
+    // making the raw pointer stale. Drop it before doing anything else.
     float mx   = mic->mMove_x;
     float my   = mic->mMove_y;
     bool  jump = (mic->mInputState[4] != 0) || ((mic->mFlagValues & 0x1) != 0);
-    mic = nullptr; // explicitly drop — do not use after this line
+    mic = nullptr; // must not be used after this line
 
     std::lock_guard<std::mutex> lk(g_keymutex);
     g_keys.w     = (my >  0.1f);
@@ -482,8 +483,8 @@ static void processinput(AInputEvent* ev) {
         int32_t btn = AMotionEvent_getButtonState(ev);
         bool nl=(btn&AMOTION_EVENT_BUTTON_PRIMARY)!=0;
         bool nr=(btn&AMOTION_EVENT_BUTTON_SECONDARY)!=0;
-        // Release g_keymutex BEFORE calling tq_push (which locks g_tqmtx).
-        // Holding both simultaneously = lock-order inversion = deadlock crash.
+        // Release g_keymutex before tq_push (which locks g_tqmtx).
+        // Holding both = lock-order inversion = deadlock crash.
         {
             std::lock_guard<std::mutex> lk(g_keymutex);
             if(nl&&!g_pl)g_lc.click(); if(nr&&!g_pr)g_rc.click();
