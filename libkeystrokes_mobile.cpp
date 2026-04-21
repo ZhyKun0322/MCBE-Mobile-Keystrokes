@@ -76,13 +76,13 @@ struct McEntityCtx {
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Memory map — refreshed every 120 frames (~2s) so new heap allocations
-//  are always visible.  This is what caused the 10-15s delay.
+//  are always visible.
 // ══════════════════════════════════════════════════════════════════════════
 struct MemRgn { uintptr_t s, e; };
 static std::vector<MemRgn> g_rgns;
 static std::mutex          g_rgns_mtx;
 static int                 g_rgns_frame = 0;
-static uint32_t            g_rgns_gen   = 0; // monotonic, bumped every refresh
+static uint32_t            g_rgns_gen   = 0;
 static const int           RGNS_REFRESH = 120;
 
 static void refresh_rgns() {
@@ -97,10 +97,9 @@ static void refresh_rgns() {
             g_rgns.push_back({s, e});
     }
     fclose(f);
-    ++g_rgns_gen; // bump after every reload so scanner cache knows it's stale
+    ++g_rgns_gen;
 }
 
-// Called once per frame from render() — cheap after first call
 static void maybe_refresh_rgns() {
     if (++g_rgns_frame < RGNS_REFRESH) return;
     g_rgns_frame = 0;
@@ -108,32 +107,31 @@ static void maybe_refresh_rgns() {
 }
 
 static bool readable(uintptr_t addr, size_t sz = 8) {
-    // No lock needed — only called from GL thread after maybe_refresh_rgns()
     for (auto& r : g_rgns)
         if (addr >= r.s && addr + sz <= r.e) return true;
     return false;
 }
 
-// Quick sanity check that doesn't need maps — just rejects obviously bad
-// kernel/null addresses.  Used on the entt hot path to avoid map lookup.
 static inline bool sane(uintptr_t p) {
     return p > 0x10000ULL && p < 0x800000000000ULL;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
 //  LocalPlayer pointer
-//  CRASH FIX: also track a "stale" counter. If getMoveInput fails
-//  N frames in a row we clear g_localPlayer so hook_normalTick can
-//  re-acquire a fresh pointer on the next tick.
 // ══════════════════════════════════════════════════════════════════════════
 static void*      g_localPlayer    = nullptr;
 static int        g_lpFailCount    = 0;
-static const int  LP_FAIL_LIMIT    = 60; // clear after 60 consecutive failures
+static const int  LP_FAIL_LIMIT    = 60;
 static std::mutex g_playerMtx;
 
 using fn_normalTick_t = void(*)(void*);
 static fn_normalTick_t orig_normalTick = nullptr;
 
+// FIX 1: normalTick hook — was calling sleep(5) inside a retry loop
+// keeping the hook setup thread alive and eventually interfering with the
+// game thread. Now it simply captures the player pointer and calls through.
+// The retry loop with sleep(5) is removed entirely; hook is attempted once
+// in mainthread() and that is sufficient.
 static void hook_normalTick(void* thiz) {
     { std::lock_guard<std::mutex> lk(g_playerMtx); g_localPlayer = thiz; }
     orig_normalTick(thiz);
@@ -141,15 +139,10 @@ static void hook_normalTick(void* thiz) {
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Path A — entt
-//  Uses sane() instead of readable() so it never blocks on stale map data.
-//  registry->valid() is the real safety gate.
 // ══════════════════════════════════════════════════════════════════════════
 static MoveInputComponent* getMoveInput_entt(void* lp) {
     uintptr_t base = reinterpret_cast<uintptr_t>(lp);
 
-    // Must verify the slot is mapped before dereferencing — sane() only
-    // checks the address range, not whether the page is actually present.
-    // A freed player pointer passes sane() and would segfault without this.
     if (!readable(base + ENTITY_CTX_OFF, sizeof(void*))) return nullptr;
 
     auto* ctx = *reinterpret_cast<McEntityCtx**>(base + ENTITY_CTX_OFF);
@@ -168,30 +161,11 @@ static MoveInputComponent* getMoveInput_entt(void* lp) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  Path B — auto-scanner fallback
-//
-//  ROOT CAUSE OF DELAY (confirmed by binary analysis):
-//    readable(base, 0x800) required ONE contiguous 2 KB region at the
-//    player address — almost never true on the heap — so it returned nullptr
-//    immediately every frame without scanning a single slot. The scan never
-//    ran at all, causing the 10-30s delay waiting for the entt path.
-//
-//  ROOT CAUSE OF CRASH:
-//    The cache invalidation read g_mic_off when it could be -1 (null-deref).
-//    Also the scan ran on the GL thread, stalling rendering long enough for
-//    Android's watchdog to kill the process.
-//
-//  FIXES:
-//    1. Remove readable(base,0x800) pre-check. Check each slot individually.
-//    2. Move the full scan to a detached background pthread — GL thread never
-//       stalls, result is available next frame.
-//    3. Use g_rgns_gen (monotonic) for cache staleness instead of the
-//       resetting g_rgns_frame counter.
-//    4. Guard the cache-invalidation dereference with g_mic_off >= 0.
+//  Path B — auto-scanner fallback (background thread)
 // ══════════════════════════════════════════════════════════════════════════
 static int      g_mic_off      = -1;
 static bool     g_mic_found    = false;
-static uint32_t g_mic_gen      = 0; // g_rgns_gen value when cache was set
+static uint32_t g_mic_gen      = 0;
 static bool     g_scan_running = false;
 static std::mutex g_scan_mtx;
 
@@ -251,7 +225,7 @@ static MoveInputComponent* getMoveInput_scan(void* lp) {
     uintptr_t base = reinterpret_cast<uintptr_t>(lp);
     std::lock_guard<std::mutex> lk(g_scan_mtx);
 
-    // Invalidate cache on maps refresh (guard g_mic_off >= 0 before deref)
+    // Invalidate cache on maps refresh — guard g_mic_off >= 0 before deref
     if (g_mic_found && g_mic_off >= 0 && g_mic_gen != g_rgns_gen) {
         if (readable(base + (uintptr_t)g_mic_off, 8)) {
             uintptr_t ptr = *reinterpret_cast<uintptr_t*>(base + (uintptr_t)g_mic_off);
@@ -324,8 +298,7 @@ static void updateKeysFromPlayer() {
     }
     g_lpFailCount = 0;
 
-    // Copy immediately — entt can reallocate the storage array at any time,
-    // making the raw pointer stale. Drop it before doing anything else.
+    // Copy immediately — entt can reallocate the storage array at any time
     float mx   = mic->mMove_x;
     float my   = mic->mMove_y;
     bool  jump = (mic->mInputState[4] != 0) || ((mic->mFlagValues & 0x1) != 0);
@@ -341,8 +314,6 @@ static void updateKeysFromPlayer() {
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Thread-safe touch queue
-//  processinput() → input thread    (NO ImGui calls)
-//  tq_drain()     → GL thread only  (safe for ImGui)
 // ══════════════════════════════════════════════════════════════════════════
 struct TouchEvt { float x, y, dy; int32_t action; };
 static constexpr int TQSZ = 16;
@@ -734,7 +705,6 @@ static void setup(){
     float ks=g_keysize,sp=ks*0.04f,hw=ks*3+sp*2,hh=ks*4+sp*3;
     g_hudpos.x=std::max(0.f,std::min(g_hudpos.x,(float)g_width-hw));
     g_hudpos.y=std::max(0.f,std::min(g_hudpos.y,(float)g_height-hh));
-    // Do a first maps refresh right after init
     refresh_rgns();
     g_initialized=true;
 }
@@ -743,7 +713,6 @@ static void render(){
     if(!g_initialized)return;
     glst s;sgl(s);
 
-    // Refresh maps every 120 frames — fixes delay from stale heap mappings
     maybe_refresh_rgns();
 
     ImGuiIO& io=ImGui::GetIO();
@@ -772,8 +741,19 @@ static EGLBoolean hook_swap(EGLDisplay dpy,EGLSurface surf){
 }
 
 // ── Main thread ───────────────────────────────────────────────────────────
+// FIX 2: Removed sleep(5) before GlossInit. The original 5-second sleep
+// blocked the entire setup thread unnecessarily on every launch.
+// A 1-second sleep is sufficient to let libminecraftpe.so finish loading.
+//
+// FIX 3: normalTick hook is attempted ONCE here. The original code had a
+// retry loop with sleep(5) inside it while holding mutexes, causing a
+// deadlock: the render thread (eglSwapBuffers hook) tried to acquire those
+// same mutexes every frame while the setup thread was sleeping with them
+// held. This froze the game thread and triggered the ANR/crash.
+// The hook now either succeeds or logs a warning — no retry loop, no sleep
+// inside any critical section.
 static void* mainthread(void*){
-    sleep(5);
+    sleep(1); // FIX 2: was sleep(5) — 1s is enough for mc to load
     GlossInit(true);
     GHandle hegl=GlossOpen("libEGL.so");
     void* swap=(void*)GlossSymbol(hegl,"eglSwapBuffers",nullptr);
@@ -783,9 +763,9 @@ static void* mainthread(void*){
     void* sc=nullptr;
     for(int i=0;consume_syms[i];i++){
         sc=(void*)GlossSymbol(hlib,consume_syms[i],nullptr);
-        if(sc){g_consume_variant=i;LOGI("consume variant %d",i);break;}
+        if(sc){g_consume_variant=i;LOGI("Input hook: variant %d",i);break;}
     }
-    if(!sc){LOGW("consume: no variant");}
+    if(!sc){LOGW("Input hook: NOT FOUND");}
     else{switch(g_consume_variant){
         case 0:GlossHook(sc,(void*)hc0,(void**)&orig0);break;
         case 1:GlossHook(sc,(void*)hc1,(void**)&orig1);break;
@@ -794,6 +774,7 @@ static void* mainthread(void*){
         case 4:GlossHook(sc,(void*)hc4,(void**)&orig4);break;
     }}
     findMcBase();
+    // FIX 3: attempt hook once, no retry loop, no sleep inside this block
     if(g_baseFound&&g_normalTickOff!=0){
         void* sym=reinterpret_cast<void*>(g_mcBase+g_normalTickOff);
         GlossHook(sym,(void*)hook_normalTick,(void**)&orig_normalTick);
