@@ -7,7 +7,6 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <mutex>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -114,15 +113,9 @@ static std::mutex g_playerMtx;
 using fn_normalTick_t = void(*)(void*);
 static fn_normalTick_t orig_normalTick = nullptr;
 
-// Forward declaration — defined after getMoveInput
-static void updateKeysFromPlayer();
-
 static void hook_normalTick(void* thiz) {
     { std::lock_guard<std::mutex> lk(g_playerMtx); g_localPlayer = thiz; }
     orig_normalTick(thiz);
-    // Update key state here on the game tick thread — correct cadence,
-    // no per-frame GL-thread memory scanning that caused delay + crashes.
-    updateKeysFromPlayer();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -212,7 +205,7 @@ static MoveInputComponent* getMoveInput(void* lp) {
 // ══════════════════════════════════════════════════════════════════════════
 //  Key state
 // ══════════════════════════════════════════════════════════════════════════
-struct KeyState { bool w, a, s, d, space, lmb, rmb; };
+struct KeyState { bool w, a, s, d, space; };
 static KeyState   g_keys  = {};
 static std::mutex g_keymutex;
 
@@ -268,7 +261,7 @@ static void tq_drain() {
 // ══════════════════════════════════════════════════════════════════════════
 //  Globals
 // ══════════════════════════════════════════════════════════════════════════
-static std::atomic<bool> g_initialized { false };
+static bool       g_initialized   = false;
 static int        g_width = 0, g_height = 0;
 static float      g_uiscale       = 1.0f;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
@@ -277,7 +270,7 @@ static float      g_keysize       = 50.0f;
 static float      g_opacity       = 1.0f;
 static float      g_rounding      = 8.0f;
 static bool       g_locked        = false;
-static std::atomic<bool> g_showsettings  { false };
+static bool       g_showsettings  = false;
 static ImVec2     g_hudpos        = ImVec2(100, 100);
 static bool       g_posloaded     = false;
 static uintptr_t  g_mcBase        = 0;
@@ -361,53 +354,23 @@ static double nowsec() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
-struct CpsTracker {
-    static const int N = 64;
-    double t[N] = {}; int h = 0, c = 0;
-    void click() { t[h] = nowsec(); h = (h+1)%N; if (c<N) c++; }
-    int get() {
-        double cut = nowsec()-1.0; int n = 0;
-        for (int i = 0; i < c; i++) { if (t[(h-1-i+N)%N] >= cut) n++; else break; }
-        return n;
-    }
-};
-static CpsTracker g_lc, g_rc;
-static bool  g_pl = false, g_pr = false;
 static float g_lasty = 0.0f;
 static bool  g_td    = false;
 
 // ── processinput  (INPUT THREAD — no ImGui calls here) ───────────────────
 static void processinput(AInputEvent* ev) {
     int32_t type = AInputEvent_getType(ev);
+    std::lock_guard<std::mutex> lk(g_keymutex);
     if (type == AINPUT_EVENT_TYPE_MOTION) {
         int32_t act = AMotionEvent_getAction(ev) & AMOTION_EVENT_ACTION_MASK;
-        int32_t btn = AMotionEvent_getButtonState(ev);
-        bool nl = (btn & AMOTION_EVENT_BUTTON_PRIMARY)   != 0;
-        bool nr = (btn & AMOTION_EVENT_BUTTON_SECONDARY) != 0;
-
-        // Narrow scope: release g_keymutex before calling tq_push (which locks g_tqmtx).
-        // Holding g_keymutex across tq_push created a potential lock-order hazard.
-        {
-            std::lock_guard<std::mutex> lk(g_keymutex);
-            if (nl && !g_pl) g_lc.click();
-            if (nr && !g_pr) g_rc.click();
-            g_pl = nl; g_pr = nr; g_keys.lmb = nl; g_keys.rmb = nr;
-        }
-
-        // Fix: always forward touch events so ImGui sees MouseDown/MouseUp.
-        // Previously gated on g_showsettings == true, which meant the long-press
-        // in drawmenu() never fired because io.MouseDown[0] was never set.
-        // g_showsettings is now atomic so it's safe to read here without a lock.
-        if (g_initialized) {
+        if (g_initialized && g_showsettings) {
             float tx = AMotionEvent_getX(ev, 0), ty = AMotionEvent_getY(ev, 0);
             if (act == AMOTION_EVENT_ACTION_DOWN) {
                 g_lasty = ty; g_td = true;
                 tq_push(tx, ty, AMOTION_EVENT_ACTION_DOWN);
             } else if (act == AMOTION_EVENT_ACTION_MOVE && g_td) {
-                // Only pass scroll delta when settings panel is open.
-                float dy = g_showsettings.load() ? (ty - g_lasty) * -0.06f : 0.f;
-                g_lasty = ty;
-                tq_push(tx, ty, AMOTION_EVENT_ACTION_MOVE, dy);
+                float dy = ty - g_lasty; g_lasty = ty;
+                tq_push(tx, ty, AMOTION_EVENT_ACTION_MOVE, dy * -0.06f);
             } else if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) {
                 g_td = false;
                 tq_push(tx, ty, AMOTION_EVENT_ACTION_UP);
@@ -465,30 +428,6 @@ static void drawkey(const char* lbl, bool on, ImVec2 sz) {
     ImGui::PushStyleColor(ImGuiCol_Text,          fg);
     ImGui::Button(lbl, sz); ImGui::PopStyleColor(4);
 }
-static void drawkeycps(const char* lbl, bool on, ImVec2 sz, int cps) {
-    float a = g_opacity;
-    ImVec4 bg = on?ImVec4(.85f,.85f,.85f,.95f*a):ImVec4(.18f,.20f,.22f,.88f*a);
-    ImVec4 fg = on?ImVec4(.05f,.05f,.05f,a)     :ImVec4(.90f,.90f,.90f,a);
-    ImGui::PushStyleColor(ImGuiCol_Button,        bg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  bg);
-    ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImGui::Button("##ck", sz);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImFont*     fn = ImGui::GetFont();
-    float fs = ImGui::GetFontSize(), sfs = fs * 0.75f;
-    ImVec2 lsz = fn->CalcTextSizeA(fs,  FLT_MAX, 0, lbl);
-    char cb[16]; snprintf(cb, 16, "%d CPS", cps);
-    ImVec2 csz = fn->CalcTextSizeA(sfs, FLT_MAX, 0, cb);
-    float bh = lsz.y+3+csz.y, bt = pos.y+(sz.y-bh)*0.5f;
-    dl->AddText(fn, fs,  ImVec2(pos.x+(sz.x-lsz.x)*0.5f, bt),
-                ImGui::ColorConvertFloat4ToU32(fg), lbl);
-    ImVec4 dim = {fg.x, fg.y, fg.z, fg.w*0.7f};
-    dl->AddText(fn, sfs, ImVec2(pos.x+(sz.x-csz.x)*0.5f, bt+lsz.y+3),
-                ImGui::ColorConvertFloat4ToU32(dim), cb);
-    ImGui::PopStyleColor(3);
-}
-
 // ── Settings panel ────────────────────────────────────────────────────────
 static void drawsettings(ImVec2 hp) {
     float sw = std::max(g_width*0.26f, 220.f);
@@ -602,21 +541,13 @@ static void drawsettings(ImVec2 hp) {
 
 // ── HUD ───────────────────────────────────────────────────────────────────
 static bool   g_pressing = false;
-static bool   g_dragging = false;
 static double g_pstart   = 0.0;
 static const double LP_SEC = 0.5;
 
 static void drawmenu() {
-    KeyState k;
-    int lc, rc;
-    {
-        std::lock_guard<std::mutex> lk(g_keymutex);
-        k  = g_keys;
-        lc = g_lc.get();
-        rc = g_rc.get();
-    }
+    KeyState k; { std::lock_guard<std::mutex> lk(g_keymutex); k = g_keys; }
     float ks = g_keysize, sp = ks*0.04f, hw = ks*3+sp*2;
-    float hh = ks*3+sp*2 + ks*1.5f+sp + ks*0.7f+sp;
+    float hh = ks*3+sp*2 + ks*0.7f+sp;
     ImGuiIO& io = ImGui::GetIO();
     bool inside = (io.MousePos.x >= g_hudpos.x && io.MousePos.x <= g_hudpos.x+hw &&
                    io.MousePos.y >= g_hudpos.y && io.MousePos.y <= g_hudpos.y+hh);
@@ -631,30 +562,18 @@ static void drawmenu() {
         g_hudpos.x += io.MouseDelta.x; g_hudpos.y += io.MouseDelta.y;
         g_hudpos.x = std::max(0.f, std::min(g_hudpos.x, (float)g_width  - hw));
         g_hudpos.y = std::max(0.f, std::min(g_hudpos.y, (float)g_height - hh));
-        g_dragging = true;  // defer save until drag ends
-    }
-    // Save only once when the finger lifts, not every drag frame (prevents microstutters)
-    if (g_dragging && !io.MouseDown[0]) {
         savecfg();
-        g_dragging = false;
     }
     if (g_showsettings) drawsettings(g_hudpos);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0,0));
     ImGui::SetNextWindowPos(g_hudpos, ImGuiCond_Always);
-    // Fix: NoInputs was blocking all mouse events → broke drag AND long-press.
-    // Only apply NoInputs when settings are open (drag intentionally disabled then).
-    {
-        ImGuiWindowFlags hud_flags =
-            ImGuiWindowFlags_NoTitleBar         |
-            ImGuiWindowFlags_NoBackground       |
-            ImGuiWindowFlags_AlwaysAutoResize   |
-            ImGuiWindowFlags_NoMove             |
-            ImGuiWindowFlags_NoFocusOnAppearing |
-            ImGuiWindowFlags_NoBringToFrontOnFocus;
-        if (g_showsettings) hud_flags |= ImGuiWindowFlags_NoInputs;
-        ImGui::Begin("##ks", nullptr, hud_flags);
-    }
+    ImGui::Begin("##ks", nullptr,
+        ImGuiWindowFlags_NoTitleBar       |
+        ImGuiWindowFlags_NoBackground     |
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoMove           |
+        ImGuiWindowFlags_NoInputs);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(sp, sp));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, g_rounding);
 
@@ -663,9 +582,6 @@ static void drawmenu() {
     drawkey("A", k.a, ImVec2(ks,ks)); ImGui::SameLine();
     drawkey("S", k.s, ImVec2(ks,ks)); ImGui::SameLine();
     drawkey("D", k.d, ImVec2(ks,ks));
-    float half = (hw-sp)*0.5f;
-    drawkeycps("LMB", k.lmb, ImVec2(half, ks*1.5f), lc); ImGui::SameLine();
-    drawkeycps("RMB", k.rmb, ImVec2(half, ks*1.5f), rc);
     drawkey("_____", k.space, ImVec2(hw, ks*0.7f));
 
     ImGui::PopStyleVar(3); ImGui::End();
@@ -687,7 +603,7 @@ static void setup() {
     ImGui_ImplOpenGL3_Init("#version 300 es");
     ImGuiStyle& st = ImGui::GetStyle();
     st.ScaleAllSizes(dp); st.WindowBorderSize = 0;
-    float ks = g_keysize, sp = ks*0.04f, hw = ks*3+sp*2, hh = ks*4+sp*3;
+    float ks = g_keysize, sp = ks*0.04f, hw = ks*3+sp*2, hh = ks*3+sp*2 + ks*0.7f+sp;
     g_hudpos.x = std::max(0.f, std::min(g_hudpos.x, (float)g_width  - hw));
     g_hudpos.y = std::max(0.f, std::min(g_hudpos.y, (float)g_height - hh));
     g_initialized = true;
@@ -702,8 +618,7 @@ static void render() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
-    // Key state is updated in hook_normalTick (game tick cadence).
-    // No per-frame memory scan here — eliminates lighting delay and GL-thread crashes.
+    updateKeysFromPlayer();       // GL thread — safe
     drawmenu();
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
