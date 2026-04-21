@@ -651,7 +651,7 @@ static void drawmenu() {
             ImGuiWindowFlags_AlwaysAutoResize   |
             ImGuiWindowFlags_NoMove             |
             ImGuiWindowFlags_NoFocusOnAppearing |
-            ImGuiWindowFlags_NoBringToDisplayOnFocus;
+            ImGuiWindowFlags_NoBringToFrontOnFocus;
         if (g_showsettings) hud_flags |= ImGuiWindowFlags_NoInputs;
         ImGui::Begin("##ks", nullptr, hud_flags);
     }
